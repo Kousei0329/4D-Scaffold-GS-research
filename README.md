@@ -2,7 +2,7 @@
 
 [Woong Oh Cho](https://raikuma.github.io/), In Cho, Seoha Kim, Jeongmin Bae, Youngjung Uh, Seon Joo Kim <br />
 
-[[`arxiv`](https://arxiv.org/abs/2411.17044)]
+[[`arxiv`](https://arxiv.org/abs/2411.17044)][[`project`](https://raikuma.github.io/4D-Scaffold-GS-Page/)]
 
 ## Overview
 
