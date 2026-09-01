@@ -1,4 +1,4 @@
-name: 4d_scaffold
+name: 4d_scaffold_naitive
 channels:
   - pytorch
   - pyg
@@ -9,15 +9,13 @@ dependencies:
   - plyfile=0.8.1
   - python=3.7.13
   - pip=22.3.1
+  - mkl==2022.1.0
+  - libtiff==4.2.0
   - pytorch=1.12.1
   - torchaudio=0.12.1
   - torchvision=0.13.1
   - pytorch-scatter
   - tqdm
-  # pinned to defaults channel: conda-forge's libtiff (.so.6) breaks this pillow build (.so.5), and
-  # conda-forge has no py3.7 pillow=9.4.0 build to fall back to
-  - defaults::pillow=9.4.0
-  - defaults::libtiff=4.2.0
   - pip:
     - einops
     - natsort
@@ -29,3 +27,5 @@ dependencies:
     - imagesize
     - submodules/diff-gaussian-rasterization
     - submodules/simple-knn
+    - submodules/gridencoder
+    - submodules/arithmetic

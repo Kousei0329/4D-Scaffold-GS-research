@@ -41,6 +41,7 @@ from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.entropy_models import get_binary_vxl_size
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from torch.utils.data import DataLoader
@@ -82,16 +83,24 @@ def saveRuntimeCode(dst: str) -> None:
     print('Backup Finished!')
 
 
+bit2MB_scale = 8 * 1024 * 1024   # for converting a BIT count (e.g. tensor.numel()*32) to MB
+byte2MB_scale = 1024 * 1024      # for converting a BYTE count (e.g. os.path.getsize()) to MB
+
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, num_workers, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.t_grid_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.temporal_opacity, dataset.use_flow, dataset.sigma_denom_weight, dataset.disable_denom_weight, dataset.hparam_beta, dataset.max_init_t)
+    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.t_grid_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
+                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.temporal_opacity, dataset.use_flow, dataset.sigma_denom_weight, dataset.disable_denom_weight, dataset.hparam_beta, dataset.max_init_t,
+                              use_entropy_coding=dataset.use_entropy_coding, hash_n_features=dataset.hash_n_features, hash_log2_size=dataset.hash_log2_size,
+                              noise_start_iter=dataset.noise_start_iter, entropy_start_iter=dataset.entropy_start_iter)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    final_size_report = None
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -147,9 +156,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             
             voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
             retain_grad = (iteration < opt.update_until and iteration >= 0)
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
-            
-            image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity, opacity_t, sigma = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"], render_pkg["opacity_t"], render_pkg["sigma"]
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, step=iteration)
+
+            image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity, opacity_t, sigma, bit_per_param = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"], render_pkg["opacity_t"], render_pkg["sigma"], render_pkg["bit_per_param"]
 
             gt_image = viewpoint_image
             Ll1 = l1_loss(image, gt_image)
@@ -157,6 +166,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             ssim_loss = (1.0 - ssim(image, gt_image))
             scaling_reg = scaling.prod(dim=1).mean()
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+
+            if bit_per_param is not None:
+                # HAC++-style hash-grid rate loss: pushes encoding_xyz's STE-binarized +-1
+                # weights to skew toward one value, which is what lets save_hash_grid's
+                # Bernoulli arithmetic coder beat a flat 1 bit/weight. Normalized by the same
+                # per-anchor element count bit_per_param already averages over, so the two
+                # terms are on the same "bits per coded element" scale before lmbda scales them.
+                denom = gaussians.get_anchor.shape[0] * (gaussians.feat_dim + 8 + 4 * gaussians.n_offsets)
+                _, bit_hash_grid, _, _ = get_binary_vxl_size((gaussians.get_encoding_params() + 1) / 2)
+                loss = loss + opt.lmbda * (bit_per_param + bit_hash_grid / denom)
 
             loss.backward()
             
@@ -187,12 +206,41 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 if iteration == opt.iterations:
                     progress_bar.close()
 
+                if dataset.use_entropy_coding and iteration % 1000 == 0 and iteration > dataset.entropy_start_iter:
+                    bits_info = gaussians.estimate_bits(mask_prune_threshold=opt.mask_prune_threshold)
+                    logger.info("\n-----[ITER {}] bits info: anchor(placeholder) {:.4f}MB, feat {:.4f}MB, scaling {:.4f}MB, offsets {:.4f}MB, anchor_num {} (kept) / {} (total)-----".format(
+                        iteration, bits_info['anchor_MB'], bits_info['feat_MB'], bits_info['scaling_MB'], bits_info['offsets_MB'],
+                        bits_info['anchor_num'], bits_info['anchor_num_total']))
+
                 # Log and save
                 training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
                 if (iteration in saving_iterations):
                     logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
-                
+
+                    if dataset.use_entropy_coding:
+                        point_cloud_path = os.path.join(scene.model_path, "point_cloud", "iteration_{}".format(iteration))
+                        bitstream_path = os.path.join(point_cloud_path, "bitstreams")
+                        enc_report = gaussians.conduct_encoding(bitstream_path, mask_prune_threshold=opt.mask_prune_threshold)
+
+                        hash_grid_MB = os.path.getsize(os.path.join(point_cloud_path, 'encoding_xyz.bin')) / byte2MB_scale
+                        mlp_files = ['grid_mlp.pt', 'opacity_mlp.pt', 'cov_mlp.pt', 'color_mlp.pt', 'flow_mlp.pt']
+                        mlp_MB = sum(os.path.getsize(os.path.join(point_cloud_path, f)) for f in mlp_files
+                                     if os.path.exists(os.path.join(point_cloud_path, f))) / byte2MB_scale
+                        # rotation/opacity are excluded here: conduct_encoding no longer stores them
+                        # per-anchor (they're frozen constants, stored once and broadcast on decode),
+                        # so they no longer contribute meaningfully to size.
+                        total_MB = (enc_report['feat_MB'] + enc_report['scaling_MB'] + enc_report['offsets_MB'] +
+                                    enc_report['anchor_geom_MB'] + enc_report['mask_MB'] + hash_grid_MB + mlp_MB)
+
+                        logger.info("\n-----[ITER {}] REAL bitstream size: feat {:.4f}MB, scaling {:.4f}MB, offsets {:.4f}MB, "
+                                    "anchor(raw,uncoded) {:.4f}MB, mask {:.4f}MB, hash_grid {:.4f}MB, mlps {:.4f}MB, TOTAL {:.4f}MB, "
+                                    "anchor_num {}-----".format(
+                                        iteration, enc_report['feat_MB'], enc_report['scaling_MB'], enc_report['offsets_MB'],
+                                        enc_report['anchor_geom_MB'], enc_report['mask_MB'], hash_grid_MB, mlp_MB, total_MB, enc_report['anchor_num']))
+
+                        final_size_report = {**enc_report, 'hash_grid_MB': hash_grid_MB, 'mlp_MB': mlp_MB, 'total_MB': total_MB, 'iteration': iteration}
+
                 # densification
                 if iteration < opt.update_until and iteration > opt.start_stat:
                     # add statis
@@ -217,7 +265,39 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                     torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-def prepare_output_and_logger(args):    
+                if iteration == opt.iterations and dataset.use_entropy_coding:
+                    # This is truly the last thing that happens to `gaussians` this run (after
+                    # densification and the optimizer step), so it's safe to overwrite its anchor
+                    # tensors with the actually-decoded ones (conduct_decoding mutates them in
+                    # place) to verify the bitstream round-trips to a working model. Doing this any
+                    # earlier in the same iteration -- e.g. right after conduct_encoding, before
+                    # densification -- leaves offset_gradient_accum/offset_denom sized for the
+                    # pre-decode anchor count while `gaussians` now holds the (generally smaller,
+                    # mask-filtered) decoded anchor count, which crashes adjust_anchor.
+                    bitstream_path = os.path.join(scene.model_path, "point_cloud", "iteration_{}".format(iteration), "bitstreams")
+                    if os.path.exists(os.path.join(bitstream_path, 'uncoded_attrs.pt')):
+                        gaussians.conduct_decoding(bitstream_path)
+                        gaussians.eval()
+                        # Render the actually-decoded (compressed) model's test-set outputs to their
+                        # own "ours_{iteration}_compressed" folder, right alongside the uncompressed
+                        # model's "ours_{iteration}" folder that render_sets() below will produce.
+                        # evaluate() (called after render_sets(), further below) scans every method
+                        # folder under test/ automatically, so this one extra render_set() call is
+                        # all that's needed to get a full SSIM/PSNR/LPIPS/ALEX report -- using the
+                        # same images that would actually ship, not an ad-hoc PSNR-only check -- for
+                        # the compressed model too, no separate evaluation path to maintain.
+                        render_set(scene.model_path, "test", "{}_compressed".format(iteration),
+                                   test_dataset, gaussians, pipe, background)
+                        logger.info("\n[ITER {}] Rendered decoded (compressed) model outputs to "
+                                    "test/ours_{}_compressed/ (see the SSIM/PSNR/LPIPS/ALEX report for "
+                                    "that folder below, alongside the uncompressed one)".format(iteration, iteration))
+                    else:
+                        logger.info("\n[ITER {}] Skipping decode verification: {} was final iteration but not in "
+                                     "--save_iterations, so no bitstream was encoded to decode.".format(iteration, iteration))
+
+    return {'size_report': final_size_report}
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -367,8 +447,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.t_grid_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.temporal_opacity, dataset.use_flow, dataset.sigma_denom_weight, dataset.disable_denom_weight, dataset.hparam_beta)
+        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.t_grid_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
+                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.temporal_opacity, dataset.use_flow, dataset.sigma_denom_weight, dataset.disable_denom_weight, dataset.hparam_beta,
+                              use_entropy_coding=dataset.use_entropy_coding, hash_n_features=dataset.hash_n_features, hash_log2_size=dataset.hash_log2_size,
+                              noise_start_iter=dataset.noise_start_iter, entropy_start_iter=dataset.entropy_start_iter)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 
@@ -560,7 +642,7 @@ if __name__ == "__main__":
             project=f"Scaffold-GS-{dataset}",
             name=exp_name,
             # Track hyperparameters and run metadata
-            settings=wandb.Settings(start_method="fork"),
+            settings=wandb.Settings(start_method="fork", mode=os.environ.get("WANDB_MODE", "online")),
             config=vars(args)
         )
     else:
@@ -576,11 +658,11 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     # training
-    training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.num_workers, args.debug_from, wandb, logger)
+    train_result = training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.num_workers, args.debug_from, wandb, logger)
     if args.warmup:
         logger.info("\n Warmup finished! Reboot from last checkpoints")
         new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args.iterations}', 'point_cloud.ply')
-        training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.num_workers, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path)
+        train_result = training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.num_workers, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path)
 
     # All done
     logger.info("\nTraining complete.")
@@ -594,3 +676,13 @@ if __name__ == "__main__":
     logger.info("\n Starting evaluation...")
     evaluate(args.model_path, visible_count=visible_count, wandb=wandb, logger=logger)
     logger.info("\nEvaluating complete.")
+
+    if train_result and train_result.get('size_report'):
+        r = train_result['size_report']
+        logger.info("\n=====[FINAL SUMMARY, iteration {}] compressed size: feat {:.4f}MB, scaling {:.4f}MB, "
+                    "offsets {:.4f}MB, anchor(raw) {:.4f}MB, mask {:.4f}MB, hash_grid {:.4f}MB, mlps {:.4f}MB, TOTAL {:.4f}MB, "
+                    "anchor_num {} -- see the 'ours_{}' (uncompressed) vs 'ours_{}_compressed' (actually "
+                    "decoded) SSIM/PSNR/LPIPS/ALEX blocks above for quality=====".format(
+                        r['iteration'], r['feat_MB'], r['scaling_MB'], r['offsets_MB'],
+                        r['anchor_geom_MB'], r['mask_MB'], r['hash_grid_MB'], r['mlp_MB'], r['total_MB'], r['anchor_num'],
+                        r['iteration'], r['iteration']))

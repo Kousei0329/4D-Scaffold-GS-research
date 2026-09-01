@@ -26,7 +26,14 @@ setup(
             "cuda_rasterizer/backward.cu",
             "rasterize_points.cu",
             "ext.cpp"],
-            extra_compile_args={"nvcc": ["-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/")]})
+            extra_compile_args={"nvcc": [
+                "-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/"),
+                # Set explicitly: torch's TORCH_CUDA_ARCH_LIST auto-detection bails out
+                # (returns no -gencode flags at all, so nvcc silently falls back to sm_52)
+                # because it does a naive substring check for "arch" in every nvcc flag,
+                # and the "-I.../research/..." path above contains "arch" (from "research").
+                "-gencode=arch=compute_86,code=sm_86",
+            ]})
         ],
     cmdclass={
         'build_ext': BuildExtension

@@ -22,8 +22,23 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
+from utils.encodings import GridEncoder, STE_binary, STE_multistep, anchor_round_digits
+from utils.entropy_models import Entropy_gaussian, get_binary_vxl_size
+from utils.arithmetic_coding import encode_gaussian_chunk as encode_gaussian, decode_gaussian_chunk as decode_gaussian
+from utils.arithmetic_coding import encode_binary, decode_binary
+from utils.octree_coding import encode_positions, decode_positions
 
-    
+# 4D anchor axes are (x, y, z, t). Since the existing 3D hash-grid CUDA kernel
+# (ported from HAC) can't be fed 4D coordinates directly, we decompose the 4D
+# anchor position into every 3-axis combination and run one 3D GridEncoder per
+# combination, then concatenate their outputs as the context feature.
+HASH_TRIPLETS = [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]  # xyz, xyt, xzt, yzt
+
+# Initial logit for the learnable per-anchor rate-distortion mask (sigmoid(2.0) ~= 0.88):
+# anchors start "mostly open" so useful ones aren't killed before they prove useful.
+MASK_INIT_LOGIT = 2.0
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -64,6 +79,11 @@ class GaussianModel:
                  disable_denom_weight : bool = False,
                  hparam_beta : float=4.0,
                  max_init_t : float=0.0,
+                 use_entropy_coding : bool = False,
+                 hash_n_features : int = 2,
+                 hash_log2_size : int = 19,
+                 noise_start_iter : int = 3_000,
+                 entropy_start_iter : int = 10_000,
                  ):
 
         self.feat_dim = feat_dim
@@ -88,6 +108,10 @@ class GaussianModel:
         self.disable_denom_weight = disable_denom_weight
         self.hparam_beta = hparam_beta
         self.max_init_t = max_init_t
+
+        self.use_entropy_coding = use_entropy_coding
+        self.noise_start_iter = noise_start_iter
+        self.entropy_start_iter = entropy_start_iter
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -152,6 +176,305 @@ class GaussianModel:
             nn.Tanh()
         ).cuda()
 
+        if self.use_entropy_coding:
+            self.x_bound_min = torch.zeros((1, 4), device="cuda")
+            self.x_bound_max = torch.ones((1, 4), device="cuda")
+            self.bounds_ready = False
+
+            self.encoding_xyz = nn.ModuleList([
+                GridEncoder(num_dim=3, n_features=hash_n_features, log2_hashmap_size=hash_log2_size,
+                            ste_binary=True, ste_multistep=False, add_noise=False, Q=1)
+                for _ in HASH_TRIPLETS
+            ]).cuda()
+
+            hash_feat_dim = self.encoding_xyz[0].output_dim * len(HASH_TRIPLETS)
+            # mlp_grid predicts a per-anchor Gaussian (mean, scale) for each entropy-coded
+            # attribute: anchor_feat (feat_dim), scaling (8-dim), offsets (4*n_offsets-dim),
+            # plus one adaptive-quantization-step adjustment logit per attribute group.
+            # anchor position (x,y,z,t) itself and mlp_flow / temporal sigma are NOT coded here.
+            grid_out_dim = 2 * feat_dim + 2 * 8 + 2 * (4 * self.n_offsets) + 3
+            self.mlp_grid = nn.Sequential(
+                nn.Linear(hash_feat_dim, feat_dim * 2),
+                nn.ReLU(True),
+                nn.Linear(feat_dim * 2, grid_out_dim),
+            ).cuda()
+
+            self.entropy_gaussian = Entropy_gaussian(Q=1).cuda()
+
+    def calc_interp_feat(self, x):
+        # x: [N, 4] anchor positions (x, y, z, t)
+        assert len(x.shape) == 2 and x.shape[1] == 4
+        x = (x - self.x_bound_min) / (self.x_bound_max - self.x_bound_min)  # -> [0, 1]
+        feats = [encoder(x[:, triplet]) for encoder, triplet in zip(self.encoding_xyz, HASH_TRIPLETS)]
+        return torch.cat(feats, dim=-1)
+
+    def forward_grid(self, feat_context):
+        y = self.mlp_grid(feat_context)
+        return torch.split(
+            y,
+            [self.feat_dim, self.feat_dim, 8, 8, 4 * self.n_offsets, 4 * self.n_offsets, 1, 1, 1],
+            dim=-1,
+        )
+
+    @staticmethod
+    def adaptive_Q(Q_base, Q_adj):
+        # HAC-style adaptive quantization step: Q in [0.1*Q_base, 2*Q_base].
+        # The floor matters more than it looks: encode_gaussian's arithmetic coder builds
+        # a CDF table sized by round(x/Q)'s range, shared across every element in one
+        # call. A Q allowed to collapse toward 0 for even a single element can blow that
+        # range up by orders of magnitude and OOM the whole batch, so Q is kept within a
+        # bounded ratio of Q_base rather than letting tanh saturate all the way to -1.
+        return torch.clamp(Q_base * (1 + torch.tanh(Q_adj)), min=Q_base * 0.1)
+
+    def get_encoding_params(self):
+        """All 4 hash-grid encoders' raw weights, concatenated and STE-binarized to +-1 --
+        i.e. exactly the embeddings actually used at inference (see STE_binary in
+        utils/encodings.py). Used both for the hash-grid rate loss (train.py: pushes this
+        distribution to skew toward 0 or 1, which is what makes it compressible below 1
+        bit/weight) and, at encode time, as the payload for save_hash_grid's real entropy
+        coding of that same skew."""
+        params = torch.cat([encoder.params.view(-1) for encoder in self.encoding_xyz], dim=0)
+        return STE_binary.apply(params)
+
+    def save_hash_grid(self, path):
+        """Entropy-code the hash grid weights with a single-probability Bernoulli arithmetic
+        coder (utils/arithmetic_coding.py: encode_binary), matching HAC++'s hash-grid rate
+        loss (get_binary_vxl_size in train.py) with an actual codec: since training pushes
+        get_encoding_params() to skew toward 0 or 1, this achieves the binary entropy of that
+        learned skew (< 1 bit/weight) rather than a flat 1 bit/weight from naive packing."""
+        shapes = [tuple(encoder.params.shape) for encoder in self.encoding_xyz]
+        binary_vals = (self.get_encoding_params() + 1) / 2  # {-1,+1} -> {0,1}
+        with open(path, 'wb') as f:
+            f.write(np.array([len(shapes)], dtype=np.int64).tobytes())
+            for s in shapes:
+                f.write(np.array(s, dtype=np.int64).tobytes())
+            encode_binary(binary_vals, f)
+
+    def load_hash_grid(self, path):
+        with open(path, 'rb') as f:
+            n_encoders = int(np.frombuffer(f.read(8), dtype=np.int64)[0])
+            shapes = [tuple(int(v) for v in np.frombuffer(f.read(16), dtype=np.int64)) for _ in range(n_encoders)]
+            binary_vals = decode_binary(f)
+        values = binary_vals * 2 - 1  # {0,1} -> {-1,+1}
+        offset = 0
+        for encoder, shape in zip(self.encoding_xyz, shapes):
+            n = shape[0] * shape[1]
+            encoder.params.data.copy_(values[offset:offset + n].view(shape))
+            offset += n
+
+    @property
+    def get_mask_anchor(self):
+        # Per-anchor rate-distortion mask: anchors whose learned probability of being
+        # "kept" falls below mask_prune_threshold are candidates for physical pruning.
+        return torch.sigmoid(self._mask_anchor)
+
+    def update_anchor_bound(self):
+        x_bound_min = (torch.min(self._anchor, dim=0, keepdim=True)[0]).detach()
+        x_bound_max = (torch.max(self._anchor, dim=0, keepdim=True)[0]).detach()
+        for c in range(x_bound_min.shape[-1]):
+            x_bound_min[0, c] = x_bound_min[0, c] * 1.2 if x_bound_min[0, c] < 0 else x_bound_min[0, c] * 0.8
+        for c in range(x_bound_max.shape[-1]):
+            x_bound_max[0, c] = x_bound_max[0, c] * 1.2 if x_bound_max[0, c] > 0 else x_bound_max[0, c] * 0.8
+        self.x_bound_min = x_bound_min
+        self.x_bound_max = x_bound_max
+        self.bounds_ready = True
+
+    def estimate_bits(self, mask_prune_threshold=0.01):
+        """Rough bit-size estimate for logging, restricted to anchors that survive the
+        rate-distortion mask (get_mask_anchor > mask_prune_threshold) -- anchors below
+        that threshold are dropped entirely rather than coded. Anchor geometry (x,y,z,t)
+        is not yet entropy-coded (V-PCC integration is a separate follow-up); it is
+        counted here as a fixed-length placeholder (anchor_round_digits bits per axis)."""
+        bit2MB_scale = 8 * 1024 * 1024
+        with torch.no_grad():
+            keep = self.get_mask_anchor.squeeze(1) > mask_prune_threshold if self.use_entropy_coding \
+                else torch.ones(self.get_anchor.shape[0], dtype=torch.bool, device="cuda")
+
+            anchor = self.get_anchor[keep]
+            N_total = self.get_anchor.shape[0]
+            N = anchor.shape[0]
+            feat = self._anchor_feat[keep]
+            scaling = self.get_scaling[keep]
+            offsets = self._offset[keep].reshape(N, -1)
+
+            feat_context = self.calc_interp_feat(anchor)
+            mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
+
+            Q_feat = self.adaptive_Q(1.0, Q_feat_adj)
+            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj)
+            Q_offsets = self.adaptive_Q(0.2, Q_offsets_adj)
+
+            feat_q = STE_multistep.apply(feat, Q_feat, feat.mean())
+            scaling_q = STE_multistep.apply(scaling, Q_scaling, scaling.mean())
+            offsets_q = STE_multistep.apply(offsets, Q_offsets, offsets.mean())
+
+            bit_feat = torch.sum(self.entropy_gaussian(feat_q, mean_feat, scale_feat, Q_feat)).item()
+            bit_scaling = torch.sum(self.entropy_gaussian(scaling_q, mean_scaling, scale_scaling, Q_scaling)).item()
+            bit_offsets = torch.sum(self.entropy_gaussian(offsets_q, mean_offsets, scale_offsets, Q_offsets)).item()
+            bit_anchor_placeholder = N * 4 * anchor_round_digits
+
+            return {
+                'anchor_MB': bit_anchor_placeholder / bit2MB_scale,
+                'feat_MB': bit_feat / bit2MB_scale,
+                'scaling_MB': bit_scaling / bit2MB_scale,
+                'offsets_MB': bit_offsets / bit2MB_scale,
+                'anchor_num': N,
+                'anchor_num_total': N_total,
+            }
+
+    def _anchor_to_int(self, anchor):
+        # anchor: [N, 4] float (x,y,z,t), already on the create_from_pcd/anchor_growing grid.
+        # Returns non-negative int64 grid coordinates plus the per-axis minimum that was
+        # subtracted (needed to shift back to world space in _int_to_anchor).
+        ix = torch.round(anchor[:, 0] / self.voxel_size).long()
+        iy = torch.round(anchor[:, 1] / self.voxel_size).long()
+        iz = torch.round(anchor[:, 2] / self.voxel_size).long()
+        it = torch.round(anchor[:, 3] / self.t_grid_size).long()
+        raw = torch.stack([ix, iy, iz, it], dim=1)
+        mins = raw.min(dim=0).values
+        return raw - mins, mins
+
+    def _int_to_anchor(self, anchor_int, mins):
+        raw = (anchor_int + mins).float()
+        xyz = raw[:, :3] * self.voxel_size
+        t = raw[:, 3:4] * self.t_grid_size
+        return torch.cat([xyz, t], dim=1)
+
+    def conduct_encoding(self, path, mask_prune_threshold=0.01):
+        """Actually arithmetic-encode feat/scaling/offsets to disk (utils/arithmetic_coding.py,
+        ported from HAC's submodules/arithmetic), using the per-anchor Gaussian mean/scale/Q
+        predicted by mlp_grid. Anchors below mask_prune_threshold are dropped entirely rather
+        than coded. Anchor position (x,y,z,t) is losslessly entropy-coded via an anisotropic
+        4D hyperoctree (utils/octree_coding.py); rotation and opacity are not per-anchor data
+        at all (see below). Returns a bit-size report dict."""
+        os.makedirs(path, exist_ok=True)
+        bit2MB_scale = 8 * 1024 * 1024
+        byte2MB_scale = 1024 * 1024
+        with torch.no_grad():
+            keep = self.get_mask_anchor.squeeze(1) > mask_prune_threshold
+            anchor = self.get_anchor[keep]
+            feat = self._anchor_feat[keep]
+            scaling = self.get_scaling[keep]
+            offsets = self._offset[keep].reshape(anchor.shape[0], -1)
+
+            # Entropy-code anchor geometry first, then reorder every other per-anchor
+            # attribute into that same canonical order -- decode_positions always returns
+            # its N leaves in this order, so aligning everything to it here means
+            # conduct_decoding needs no separate un-permutation step at all.
+            # encode_positions returns perm such that decoded[perm[i]] == anchor_int[i], i.e.
+            # perm maps FROM this original order TO the decoded order -- so to reorder INTO
+            # decoded order we need its inverse (argsort(perm)), not perm itself.
+            anchor_int, anchor_mins = self._anchor_to_int(anchor)
+            perm = encode_positions(anchor_int, os.path.join(path, 'anchor_geom.b'))
+            inv_perm = torch.argsort(perm)
+            anchor, feat, scaling, offsets = anchor[inv_perm], feat[inv_perm], scaling[inv_perm], offsets[inv_perm]
+            N = anchor.shape[0]
+
+            feat_context = self.calc_interp_feat(anchor)
+            mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
+
+            Q_feat = self.adaptive_Q(1.0, Q_feat_adj).expand(N, self.feat_dim).contiguous()
+            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj).expand(N, 8).contiguous()
+            Q_offsets = self.adaptive_Q(0.2, Q_offsets_adj).expand(N, 4 * self.n_offsets).contiguous()
+
+            feat_q = STE_multistep.apply(feat, Q_feat, feat.mean())
+            scaling_q = STE_multistep.apply(scaling, Q_scaling, scaling.mean())
+            offsets_q = STE_multistep.apply(offsets, Q_offsets, offsets.mean())
+
+            bits_feat = encode_gaussian(feat_q.reshape(-1), mean_feat.reshape(-1), scale_feat.reshape(-1),
+                                         Q_feat.reshape(-1), os.path.join(path, 'feat.b'))
+            bits_scaling = encode_gaussian(scaling_q.reshape(-1), mean_scaling.reshape(-1), scale_scaling.reshape(-1),
+                                            Q_scaling.reshape(-1), os.path.join(path, 'scaling.b'))
+            bits_offsets = encode_gaussian(offsets_q.reshape(-1), mean_offsets.reshape(-1), scale_offsets.reshape(-1),
+                                            Q_offsets.reshape(-1), os.path.join(path, 'offsets.b'))
+
+            # rotation/opacity are NOT stored per-anchor at all: create_from_pcd and
+            # anchor_growing always initialize every anchor to the same frozen
+            # (requires_grad=False) identity rotation / constant opacity, and nothing in the
+            # model ever trains or otherwise varies them, so every kept anchor's value is
+            # identical -- one copy is stored and broadcast back on decode. If that assumption
+            # is ever violated (e.g. a future change starts training them), the full
+            # per-anchor tensor is stored instead so decode still reconstructs correctly.
+            rotation = self._rotation[keep][inv_perm].detach()
+            opacity = self._opacity[keep][inv_perm].detach()
+            rotation_is_constant = bool(torch.all(rotation == rotation[0:1]))
+            opacity_is_constant = bool(torch.all(opacity == opacity[0:1]))
+
+            # The rate-distortion mask is CONTINUOUS (sigmoid(_mask_anchor) in (0,1)), not
+            # binary -- keep_mask above only decides which anchors survive at all, but most
+            # survivors still have a small-but-nonzero mask (e.g. 0.05) that meaningfully
+            # dampens their rendered opacity. Losing that and treating every kept anchor as
+            # "fully open" on decode reintroduces exactly the anchors training learned to
+            # mostly (not entirely) suppress, at full strength -- a real, measured source of
+            # a ~10dB PSNR drop between the uncompressed and decoded models. 1 byte/anchor is
+            # cheap enough to store raw rather than build a dedicated entropy coder for it.
+            mask_soft = self.get_mask_anchor[keep][inv_perm].detach()
+            mask_q = torch.round(mask_soft * 255).clamp(0, 255).to(torch.uint8)
+
+            torch.save({
+                'anchor_mins': anchor_mins.cpu(),
+                'mask_q': mask_q.cpu(),
+                'rotation': (rotation[0:1] if rotation_is_constant else rotation).cpu(),
+                'rotation_is_constant': rotation_is_constant,
+                'opacity': (opacity[0:1] if opacity_is_constant else opacity).cpu(),
+                'opacity_is_constant': opacity_is_constant,
+            }, os.path.join(path, 'uncoded_attrs.pt'))
+
+            return {
+                'anchor_num': N,
+                'anchor_geom_MB': os.path.getsize(os.path.join(path, 'anchor_geom.b')) / byte2MB_scale,
+                'mask_MB': mask_q.numel() / byte2MB_scale,
+                'feat_MB': bits_feat / bit2MB_scale,
+                'scaling_MB': bits_scaling / bit2MB_scale,
+                'offsets_MB': bits_offsets / bit2MB_scale,
+            }
+
+    def conduct_decoding(self, path):
+        """Inverse of conduct_encoding. Requires mlp_grid/encoding_xyz to already be loaded
+        (e.g. via load_mlp_checkpoints) with the SAME weights used at encode time, since the
+        per-anchor mean/scale/Q are recomputed from anchor position, not stored in the bitstream."""
+        with torch.no_grad():
+            uncoded = torch.load(os.path.join(path, 'uncoded_attrs.pt'))
+            anchor_mins = uncoded['anchor_mins'].cuda()
+            anchor_int = decode_positions(os.path.join(path, 'anchor_geom.b'))
+            anchor = self._int_to_anchor(anchor_int, anchor_mins)
+            N = anchor.shape[0]
+
+            feat_context = self.calc_interp_feat(anchor)
+            mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
+
+            Q_feat = self.adaptive_Q(1.0, Q_feat_adj).expand(N, self.feat_dim).contiguous()
+            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj).expand(N, 8).contiguous()
+            Q_offsets = self.adaptive_Q(0.2, Q_offsets_adj).expand(N, 4 * self.n_offsets).contiguous()
+
+            feat = decode_gaussian(mean_feat.reshape(-1), scale_feat.reshape(-1),
+                                    Q_feat.reshape(-1), os.path.join(path, 'feat.b')).view(N, self.feat_dim)
+            scaling_act = decode_gaussian(mean_scaling.reshape(-1), scale_scaling.reshape(-1),
+                                          Q_scaling.reshape(-1), os.path.join(path, 'scaling.b')).view(N, 8)
+            offsets = decode_gaussian(mean_offsets.reshape(-1), scale_offsets.reshape(-1),
+                                       Q_offsets.reshape(-1), os.path.join(path, 'offsets.b')).view(N, self.n_offsets, 4)
+
+            self._anchor = nn.Parameter(anchor)
+            self._anchor_feat = nn.Parameter(feat)
+            self._offset = nn.Parameter(offsets)
+            # get_scaling = exp(_scaling), so invert with log to store back in _scaling's space
+            self._scaling = nn.Parameter(self.scaling_inverse_activation(scaling_act.clamp(min=1e-9)))
+            rotation = uncoded['rotation'].cuda()
+            if uncoded.get('rotation_is_constant', True):
+                rotation = rotation.expand(N, -1).contiguous()
+            opacity = uncoded['opacity'].cuda()
+            if uncoded.get('opacity_is_constant', True):
+                opacity = opacity.expand(N, -1).contiguous()
+            self._rotation = nn.Parameter(rotation)
+            self._opacity = nn.Parameter(opacity)
+            # Reconstruct the real (8-bit quantized) continuous mask value rather than
+            # treating every surviving anchor as fully open -- see conduct_encoding's
+            # comment on mask_q for why that matters.
+            mask_soft = uncoded['mask_q'].cuda().float() / 255
+            self._mask_anchor = nn.Parameter(inverse_sigmoid(mask_soft.clamp(1e-6, 1 - 1e-6)).view(N, 1))
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -161,6 +484,9 @@ class GaussianModel:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
+        if self.use_entropy_coding:
+            self.mlp_grid.eval()
+            self.encoding_xyz.eval()
 
     def train(self):
         self.mlp_opacity.train()
@@ -168,8 +494,11 @@ class GaussianModel:
         self.mlp_color.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
-        if self.use_feat_bank:                   
+        if self.use_feat_bank:
             self.mlp_feature_bank.train()
+        if self.use_entropy_coding:
+            self.mlp_grid.train()
+            self.encoding_xyz.train()
 
     def capture(self):
         return (
@@ -323,6 +652,10 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
+        if self.use_entropy_coding:
+            mask_anchor = torch.full((fused_point_cloud.shape[0], 1), MASK_INIT_LOGIT, device="cuda")
+            self._mask_anchor = nn.Parameter(mask_anchor.requires_grad_(True))
+
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -383,6 +716,11 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
             ]
 
+        if self.use_entropy_coding:
+            l.append({'params': self.mlp_grid.parameters(), 'lr': training_args.mlp_grid_lr_init, "name": "mlp_grid"})
+            l.append({'params': self.encoding_xyz.parameters(), 'lr': training_args.encoding_xyz_lr_init, "name": "encoding_xyz"})
+            l.append({'params': [self._mask_anchor], 'lr': training_args.mask_lr, "name": "mask_anchor"})
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -423,6 +761,15 @@ class GaussianModel:
                                                         lr_final=training_args.appearance_lr_final,
                                                         lr_delay_mult=training_args.appearance_lr_delay_mult,
                                                         max_steps=training_args.appearance_lr_max_steps)
+        if self.use_entropy_coding:
+            self.mlp_grid_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_grid_lr_init,
+                                                        lr_final=training_args.mlp_grid_lr_final,
+                                                        lr_delay_mult=training_args.mlp_grid_lr_delay_mult,
+                                                        max_steps=training_args.mlp_grid_lr_max_steps)
+            self.encoding_xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.encoding_xyz_lr_init,
+                                                        lr_final=training_args.encoding_xyz_lr_final,
+                                                        lr_delay_mult=training_args.encoding_xyz_lr_delay_mult,
+                                                        max_steps=training_args.encoding_xyz_lr_max_steps)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -451,6 +798,12 @@ class GaussianModel:
             if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
                 param_group['lr'] = lr
+            if self.use_entropy_coding and param_group["name"] == "mlp_grid":
+                lr = self.mlp_grid_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if self.use_entropy_coding and param_group["name"] == "encoding_xyz":
+                lr = self.encoding_xyz_scheduler_args(iteration)
+                param_group['lr'] = lr
             
             
     def construct_list_of_attributes(self):
@@ -464,6 +817,8 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        if self.use_entropy_coding:
+            l.append('mask_anchor')
         return l
 
     def save_ply(self, path):
@@ -478,8 +833,11 @@ class GaussianModel:
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
+        to_cat = [anchor, offset, anchor_feat, opacities, scale, rotation]
+        if self.use_entropy_coding:
+            to_cat.append(self._mask_anchor.detach().cpu().numpy())
+        attributes = np.concatenate(to_cat, axis=1)
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, offset, anchor_feat, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -560,6 +918,12 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
+        if self.use_entropy_coding:
+            if "mask_anchor" in [p.name for p in plydata.elements[0].properties]:
+                mask_anchor = np.asarray(plydata.elements[0]["mask_anchor"])[..., np.newaxis].astype(np.float32)
+            else:
+                mask_anchor = np.full((anchor.shape[0], 1), MASK_INIT_LOGIT, dtype=np.float32)
+            self._mask_anchor = nn.Parameter(torch.tensor(mask_anchor, dtype=torch.float, device="cuda").requires_grad_(True))
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -583,7 +947,8 @@ class GaussianModel:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
                 'feat_base' in group['name'] or \
-                'embedding' in group['name']:
+                'embedding' in group['name'] or \
+                'encoding' in group['name']:
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
@@ -660,7 +1025,8 @@ class GaussianModel:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
                 'feat_base' in group['name'] or \
-                'embedding' in group['name']:
+                'embedding' in group['name'] or \
+                'encoding' in group['name']:
                 continue
 
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -700,6 +1066,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if self.use_entropy_coding:
+            self._mask_anchor = optimizable_tensors["mask_anchor"]
 
     
     def anchor_growing(self, opt, grads, threshold, offset_mask, timestamp):
@@ -812,7 +1180,9 @@ class GaussianModel:
                     "offset": new_offsets,
                     "opacity": new_opacities,
                 }
-                
+                if self.use_entropy_coding:
+                    d["mask_anchor"] = torch.full((candidate_anchor.shape[0], 1), MASK_INIT_LOGIT, device="cuda")
+
 
                 temp_anchor_demon = torch.cat([self.anchor_demon, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
                 del self.anchor_demon
@@ -831,6 +1201,8 @@ class GaussianModel:
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
+                if self.use_entropy_coding:
+                    self._mask_anchor = optimizable_tensors["mask_anchor"]
                 
 
 
@@ -873,7 +1245,11 @@ class GaussianModel:
         # # prune anchors
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
-        prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+        prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N]
+        if self.use_entropy_coding:
+            # rate-distortion mask: anchors the model has learned are not worth their coding cost
+            rate_prune_mask = (self.get_mask_anchor.squeeze(dim=1) < opt.mask_prune_threshold)
+            prune_mask = torch.logical_or(prune_mask, rate_prune_mask)
         
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
@@ -949,6 +1325,17 @@ class GaussianModel:
                 emd.save(os.path.join(path, 'embedding_appearance.pt'))
                 self.embedding_appearance.train()
 
+            if self.use_entropy_coding:
+                self.mlp_grid.eval()
+                hash_feat_dim = self.encoding_xyz[0].output_dim * len(HASH_TRIPLETS)
+                grid_mlp = torch.jit.trace(self.mlp_grid, (torch.rand(1, hash_feat_dim).cuda()))
+                grid_mlp.save(os.path.join(path, 'grid_mlp.pt'))
+                self.mlp_grid.train()
+
+                self.save_hash_grid(os.path.join(path, 'encoding_xyz.bin'))
+                torch.save({'x_bound_min': self.x_bound_min, 'x_bound_max': self.x_bound_max},
+                           os.path.join(path, 'anchor_bound.pt'))
+
         elif mode == 'unite':
             if self.use_feat_bank:
                 torch.save({
@@ -988,6 +1375,13 @@ class GaussianModel:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:
                 self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
+            if self.use_entropy_coding:
+                self.mlp_grid = torch.jit.load(os.path.join(path, 'grid_mlp.pt')).cuda()
+                self.load_hash_grid(os.path.join(path, 'encoding_xyz.bin'))
+                bounds = torch.load(os.path.join(path, 'anchor_bound.pt'))
+                self.x_bound_min = bounds['x_bound_min']
+                self.x_bound_max = bounds['x_bound_max']
+                self.bounds_ready = True
         elif mode == 'unite':
             checkpoint = torch.load(os.path.join(path, 'checkpoints.pth'))
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])

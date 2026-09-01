@@ -94,6 +94,13 @@ class ModelParams(ParamGroup):
         self.sigma_denom_weight = False
         self.disable_denom_weight = False
         self.filter_opacity = False
+
+        # entropy coding (HAC-style hash-grid context model)
+        self.use_entropy_coding = False
+        self.hash_n_features = 2
+        self.hash_log2_size = 19
+        self.noise_start_iter = 3_000
+        self.entropy_start_iter = 10_000
         
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -175,6 +182,21 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
 
         self.lambda_temporal_sigma = 1.0 # Gamma in the paper
+
+        # entropy coding (HAC-style hash-grid context model)
+        self.lmbda = 0.001
+        self.encoding_xyz_lr_init = 0.005
+        self.encoding_xyz_lr_final = 0.00001
+        self.encoding_xyz_lr_delay_mult = 0.33
+        self.encoding_xyz_lr_max_steps = 30_000
+
+        self.mlp_grid_lr_init = 0.005
+        self.mlp_grid_lr_final = 0.00001
+        self.mlp_grid_lr_delay_mult = 0.01
+        self.mlp_grid_lr_max_steps = 30_000
+
+        self.mask_lr = 0.01
+        self.mask_prune_threshold = 0.01
 
         # Some experimental options
         self.lambda_sigma_multiply = 1.0

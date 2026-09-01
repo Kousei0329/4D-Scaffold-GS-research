@@ -14,17 +14,71 @@ from einops import repeat
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
+from utils.encodings import STE_multistep
 
 global_cache = {}
 
-def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False, save_cache=False):
+def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False, save_cache=False, step=0):
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
-    
+
     feat = pc._anchor_feat[visible_mask]
     anchor = pc.get_anchor[visible_mask]
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
+
+    bit_per_param = None
+    mask_anchor_soft = None
+    if pc.use_entropy_coding:
+        mask_anchor_soft = pc.get_mask_anchor[visible_mask]  # [N_vis, 1], differentiable gate
+
+    if is_training and pc.use_entropy_coding:
+        if step == pc.entropy_start_iter:
+            pc.update_anchor_bound()
+
+        if step > pc.noise_start_iter:
+            feat = feat + torch.empty_like(feat).uniform_(-0.5, 0.5) * 1.0
+            grid_scaling = grid_scaling + torch.empty_like(grid_scaling).uniform_(-0.5, 0.5) * 0.001
+            grid_offsets = grid_offsets + torch.empty_like(grid_offsets).uniform_(-0.5, 0.5) * 0.2
+
+        if step > pc.entropy_start_iter:
+            feat_context = pc.calc_interp_feat(anchor)
+            mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                Q_feat_adj, Q_scaling_adj, Q_offsets_adj = pc.forward_grid(feat_context)
+
+            Q_feat = pc.adaptive_Q(1.0, Q_feat_adj)
+            Q_scaling = pc.adaptive_Q(0.001, Q_scaling_adj)
+            Q_offsets = pc.adaptive_Q(0.2, Q_offsets_adj)
+
+            grid_offsets_flat = grid_offsets.reshape(anchor.shape[0], -1)  # [N_vis, 4*n_offsets]
+
+            bit_feat = pc.entropy_gaussian(feat, mean_feat, scale_feat, Q_feat, x_mean=pc._anchor_feat.mean())
+            bit_scaling = pc.entropy_gaussian(grid_scaling, mean_scaling, scale_scaling, Q_scaling, x_mean=pc.get_scaling.mean())
+            bit_offsets = pc.entropy_gaussian(grid_offsets_flat, mean_offsets, scale_offsets, Q_offsets, x_mean=pc._offset.mean())
+
+            # rate-distortion mask gates the coding cost: an anchor the model has learned
+            # is not worth keeping contributes ~0 bits here (and see below, ~0 opacity too,
+            # so dropping it doesn't help the loss unless it is genuinely not needed).
+            bit_feat = bit_feat * mask_anchor_soft
+            bit_scaling = bit_scaling * mask_anchor_soft
+            bit_offsets = bit_offsets * mask_anchor_soft
+
+            bit_per_param = (bit_feat.sum() + bit_scaling.sum() + bit_offsets.sum()) / \
+                            (bit_feat.numel() + bit_scaling.numel() + bit_offsets.numel())
+
+    elif (not is_training) and pc.use_entropy_coding and pc.bounds_ready:
+        # Deterministic (no-noise) quantization at eval time, so rendered quality reflects
+        # what a real decoder would reconstruct from the coded bitstream.
+        feat_context = pc.calc_interp_feat(anchor)
+        _, _, _, _, _, _, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = pc.forward_grid(feat_context)
+
+        Q_feat = pc.adaptive_Q(1.0, Q_feat_adj)
+        Q_scaling = pc.adaptive_Q(0.001, Q_scaling_adj)
+        Q_offsets = pc.adaptive_Q(0.2, Q_offsets_adj).unsqueeze(1)  # broadcast over n_offsets
+
+        feat = STE_multistep.apply(feat, Q_feat, pc._anchor_feat.mean())
+        grid_scaling = STE_multistep.apply(grid_scaling, Q_scaling, pc.get_scaling.mean())
+        grid_offsets = STE_multistep.apply(grid_offsets, Q_offsets, pc._offset.mean())
 
     ## get view properties for anchor
     ob_view = anchor[:, :3] - viewpoint_camera.camera_center
@@ -98,12 +152,18 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     offsets = grid_offsets.view([-1, 4]) # [mask]
 
     # combine for parallel masking
-    concatenated = torch.cat([grid_scaling, anchor], dim=-1)
+    if mask_anchor_soft is not None:
+        concatenated = torch.cat([grid_scaling, anchor, mask_anchor_soft], dim=-1)
+    else:
+        concatenated = torch.cat([grid_scaling, anchor], dim=-1)
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
     concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets, flow], dim=-1)
     masked = concatenated_all[mask]
-    scaling_repeat, repeat_anchor, color, scale_rot, offsets, flow = masked.split([8, 4, 3, 8, 4, 3], dim=-1)
-    
+    if mask_anchor_soft is not None:
+        scaling_repeat, repeat_anchor, mask_anchor_repeat, color, scale_rot, offsets, flow = masked.split([8, 4, 1, 3, 8, 4, 3], dim=-1)
+    else:
+        scaling_repeat, repeat_anchor, color, scale_rot, offsets, flow = masked.split([8, 4, 3, 8, 4, 3], dim=-1)
+
     # post-process cov
     scaling = scaling_repeat[:,4:7] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
     rot = pc.rotation_activation(scale_rot[:,4:8])
@@ -133,20 +193,23 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         global_cache["t"] = t.detach()
 
     opacity = opacity * opacity_t
+    if mask_anchor_soft is not None:
+        opacity = opacity * mask_anchor_repeat
 
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask, opacity_t, sigma
+        return xyz, color, opacity, scaling, rot, neural_opacity, mask, opacity_t, sigma, bit_per_param
     else:
         return xyz, color, opacity, scaling, rot, flow, opacity_t, sigma, mask
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, color_mode="rgb", save_cache=False, precolor=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, color_mode="rgb", save_cache=False, precolor=None, step=0):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
     is_training = pc.get_color_mlp.training
-    
+    bit_per_param = None
+
     if global_cache.get("xyz") is not None:
         ## use cached values
 
@@ -192,7 +255,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         mask = temp_mask
     else:
         if is_training:
-            xyz, color, opacity, scaling, rot, neural_opacity, mask, opacity_t, sigma = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, save_cache=save_cache)
+            xyz, color, opacity, scaling, rot, neural_opacity, mask, opacity_t, sigma, bit_per_param = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, save_cache=save_cache, step=step)
         else:
             xyz, color, opacity, scaling, rot, flow, opacity_t, sigma, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training, save_cache=save_cache)
 
@@ -260,6 +323,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "scaling": scaling,
                 "opacity_t": opacity_t,
                 "sigma": sigma,
+                "bit_per_param": bit_per_param,
                 }
     else:
         return {"render": rendered_image,

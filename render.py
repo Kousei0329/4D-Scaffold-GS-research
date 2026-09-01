@@ -91,8 +91,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
      
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_images : bool, skip_fps : bool):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.t_grid_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.temporal_opacity, dataset.use_flow, dataset.sigma_denom_weight)
+        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.t_grid_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
+                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.temporal_opacity, dataset.use_flow, dataset.sigma_denom_weight,
+                              use_entropy_coding=dataset.use_entropy_coding, hash_n_features=dataset.hash_n_features, hash_log2_size=dataset.hash_log2_size,
+                              noise_start_iter=dataset.noise_start_iter, entropy_start_iter=dataset.entropy_start_iter)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()

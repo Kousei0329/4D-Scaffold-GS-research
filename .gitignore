@@ -9,6 +9,8 @@ wandb*
 *.bak
 data
 *build/*
+build/
+*.egg-info/
 *__pycache__*
 diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
