@@ -26,17 +26,41 @@ Ubuntu 20.04、CUDA 11.6のサーバーで動作確認しています。類似�
 
 1. このリポジトリをクローン:
 
-```
-git clone https://github.com/raikuma/4D-Scaffold-GS.git
-cd 4D-Scaffold-GS
+```bash
+git clone https://github.com/Kousei0329/4D-Scaffold-GS-research.git
+cd 4D-Scaffold-GS-research
 ```
 
 2. 依存関係をインストール
 
-```
+`environment.yml`の環境名は`4d_scaffold_naitive`です(このフォークでの変更点を参照)。
+
+```bash
 SET DISTUTILS_USE_SDK=1 # Windows only
 conda env create --file environment.yml
-conda activate 4d_scaffold
+conda activate 4d_scaffold_naitive
+```
+
+これで以下のCUDA拡張が全て自動的にビルドされます(`environment.yml`の`pip:`セクション経由)。
+
+| 拡張 | 用途 |
+|---|---|
+| `submodules/diff-gaussian-rasterization` | ガウシアンのラスタライズ(本体、元々必要) |
+| `submodules/simple-knn` | 最近傍探索(元々必要) |
+| `submodules/gridencoder` | 圧縮機能のハッシュグリッド(後述、`--use_entropy_coding`時のみ使用) |
+| `submodules/arithmetic` | 圧縮機能の算術符号化器(後述、`--use_entropy_coding`時のみ使用) |
+
+3. (任意)ビルドが正しく通ったか確認:
+
+```bash
+python -c "import diff_gaussian_rasterization, simple_knn, _gridencoder, arithmetic; print('all extensions OK')"
+```
+
+いずれかで`ImportError`が出る場合は、該当のサブモジュールだけ個別に入れ直してください。
+
+```bash
+pip install ./submodules/gridencoder
+pip install ./submodules/arithmetic
 ```
 
 ## データ
@@ -110,6 +134,26 @@ bash ./scripts/train_n3dv.sh cook_spinach
 
 このスクリプトは、ログ（実行時コードを含む）を```outputs/dataset_name/scene_name/exp_name/cur_time```に自動的に保存します。
 
+`scripts/train_n3dv.sh`はデフォルトで複数のλ(圧縮の強さ)を順番に学習するレート歪み(RD)スイープになっています。中の`LAMBDAS=(...)`配列を編集すれば、試すλの値・個数を変更できます。単一のλだけで良い場合は配列を1要素にしてください。
+
+## 圧縮(エントロピー符号化)
+
+[HAC](https://github.com/YihangChen-ee/HAC) / [HAC++](https://github.com/YihangChen-ee/HAC-plus)を参考に、anchorのfeat/scaling/offsets、ハッシュグリッド、anchor座標(x,y,z,t)を実際に算術符号化してファイルサイズを縮める機能を追加しています。デフォルトでは無効(`--use_entropy_coding`を付けない限り、元の4D-Scaffold-GSと完全に同じ挙動)です。
+
+有効にするには`train.py`に以下を追加します(`scripts/train_n3dv.sh`には既に付いています)。
+
+```bash
+python train.py ... --use_entropy_coding --lmbda 0.001
+```
+
+- `--lmbda`: 圧縮の強さ(大きいほど高圧縮・低画質寄り)。デフォルト`0.001`
+- `--mask_prune_threshold`: 学習で「不要」と判断されたanchorを間引く閾値。デフォルト`0.01`
+- `--hash_log2_size`: ハッシュグリッドのテーブルサイズ(2のべき乗)。デフォルト`19`
+
+有効にすると、`point_cloud/iteration_N/`配下に通常の`point_cloud.ply`(無圧縮の生データ、互換性のため常に保存)に加えて、実際に圧縮された`bitstreams/`フォルダ(`feat.b`, `scaling.b`, `offsets.b`, `anchor_geom.b`など)と、1bitパック済みのハッシュグリッド`encoding_xyz.bin`が保存されます。学習完了時には、実際に圧縮ビットストリームから復号したモデルで`test/ours_{iteration}_compressed/`にレンダリング結果を保存し、通常の(無圧縮の)`test/ours_{iteration}/`と並べてSSIM/PSNR/LPIPS/ALEXを両方出力するので、圧縮による画質への影響をそのまま比較できます。
+
+各`iteration`のログには、圧縮後の内訳サイズ(`feat`/`scaling`/`offsets`/`anchor`/`mask`/`hash_grid`/`mlps`の各MB、および合計)も出力されます。
+
 ## 評価
 
 レンダリングと指標計算の処理は学習コードに統合済みです。そのため、学習が完了すると```rendering results```、```fps```、```quality metrics```が自動的に出力されます。レンダリング結果はログディレクトリに保存されます。```fps```は以下のようにおおまかに計測している点にご注意ください。
@@ -167,3 +211,21 @@ python metrics.py -m <path to trained model> # レンダリング結果の誤差
   - `readNerfSyntheticInfo`内、`points3d.ply`が存在せずランダム初期点群にフォールバックする際の`BasicPointCloud(...)`呼び出しに、抜けていた`times=None`引数を追加（`TypeError: __new__() missing 1 required positional argument: 'times'`で学習開始前にクラッシュしていた）
 - `scripts/train_n3dv.sh`
   - `num_workers`を`8`から`0`に変更。コンテナの`/dev/shm`が小さい（デフォルト64MB）環境で、DataLoaderのワーカープロセスが共有メモリ不足によりバスエラーで落ちる問題の回避策。`--shm-size`を十分な大きさ（例: 8GB以上）で確保できるコンテナ環境であれば、`8`に戻して問題ありません
+
+**2026-09-01**
+
+[HAC](https://github.com/YihangChen-ee/HAC) / [HAC++](https://github.com/YihangChen-ee/HAC-plus)を参考に、実際にファイルサイズを縮めるエントロピー符号化(圧縮)機能を追加しました。デフォルトでは無効(`--use_entropy_coding`を付けない限り、既存の動作に一切影響しません)。詳細は上記「圧縮(エントロピー符号化)」セクションを参照してください。
+
+- `scene/gaussian_model.py`
+  - 4分解ハッシュグリッド(xyz, xyt, xzt, yzt)によるコンテキストモデル(`mlp_grid`, `calc_interp_feat`)、anchorごとの適応的量子化幅、学習可能なレート歪みマスク(`_mask_anchor`)を追加
+  - `conduct_encoding`/`conduct_decoding`: feat/scaling/offsetsの実算術符号化、ハッシュグリッドのBernoulli符号化、anchor座標(x,y,z,t)の4次元ハイパーオクツリー符号化を実装
+- `utils/encodings.py`, `utils/entropy_models.py`, `utils/arithmetic_coding.py`, `utils/octree_coding.py`(新規)
+  - HACから移植したハッシュグリッド実装・エントロピーモデル、および実際の算術符号化・4次元オクツリー符号化のユーティリティ
+- `submodules/gridencoder`, `submodules/arithmetic`(新規、HACから移植)
+  - ハッシュグリッドのCUDA実装、算術符号化器のCUDA実装。`environment.yml`の`pip:`セクションに追加済み
+- `gaussian_renderer/__init__.py`, `train.py`
+  - 学習時のレート歪み損失、量子化ノイズのウォームアップスケジュール、`saving_iterations`での実圧縮サイズのログ出力、学習終了時に実際に復号したモデルで`test/ours_{iteration}_compressed/`をレンダリング・評価する処理を追加
+- `render.py`
+  - `GaussianModel`構築時にentropy coding関連の引数を渡し忘れていたバグを修正(圧縮モデルの評価時に学習済みマスクが適用されず画質が大きく低下する原因になっていました)
+- `scripts/train_n3dv.sh`
+  - 複数のλ(圧縮の強さ)を順番に学習するレート歪み(RD)スイープに変更
