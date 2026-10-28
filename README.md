@@ -229,3 +229,23 @@ python metrics.py -m <path to trained model> # レンダリング結果の誤差
   - `GaussianModel`構築時にentropy coding関連の引数を渡し忘れていたバグを修正(圧縮モデルの評価時に学習済みマスクが適用されず画質が大きく低下する原因になっていました)
 - `scripts/train_n3dv.sh`
   - 複数のλ(圧縮の強さ)を順番に学習するレート歪み(RD)スイープに変更
+
+**2026-10-28**
+
+動的シーン(人物の動きなど)での再構成品質向上を狙った、モーションモデルのアブレーションと密度化トリガーの追加、およびいくつかの安定性バグ修正を行いました。デフォルトでは全て無効(既存の動作に影響なし)です。
+
+- `--motion_model`: アンカーごとの動き表現を切り替えます(デフォルト`linear`)
+  - `linear`: 元々の実装。学習された単一の速度ベクトルのみ(`xyz(t) = base + velocity・dt`)
+  - `basis`: DynMF/TED-4DGS的な、学習済み時間基底との線形結合
+  - `fourier`: 固定のsin/cos調和基底との線形結合(学習パラメータなし)
+  - `taylor_residual`: 速度・加速度・躍度(3次多項式)+学習済み基底による残差補正。`dt`と最終変位をクランプしており(詳細はコード内コメント参照)、これがないと訓練中に稀に発散し、視錐台外にアンカーが押し出されてクラッシュすることがあります
+- `--motion_sigma_reg_weight`(デフォルト`0.0`): 動きが速い領域ほどtemporal opacityの時間窓を狭める正則化損失の重み。実験では`0.002`〜`0.003`程度で複数シーンにおいてbaselineをPSNR・サイズ両面で上回る結果が得られています。大きすぎる値(`0.01`など)は背景領域の品質を犠牲にするので注意
+- `--flow_densify_threshold`(デフォルト`0.0`): `--photo_densify_threshold`と同じ仕組みの追加密度化トリガーで、写真誤差ではなく平均的な動きの速さ(flow速度)が閾値を超えたオフセットを成長候補に加えます
+- `--disable_mip_filter`: Mip-Splatting風の3Dフィルタ(`compute_3D_filter`、学習カメラ集合から決定論的に計算される分散フロア)を無効化します
+- `render_cached`/`render()`: N3DV/Neu3Dのテストプロトコル(同一カメラ・複数タイムスタンプ)向けに、カメラが変わらない限りアンカーのneural-Gaussian出力をキャッシュして再利用するようになりました
+- `--use_joint_4d_hash`: (x, y, z, t)を1つのハッシュグリッドで扱う4次元ジョイントハッシュのオプションを追加(`submodules/gridencoder`のcase 4を有効化)
+- 安定性バグ修正(いずれも実際に再現したクラッシュへの対処)
+  - `ChannelCtxFeat.forward`/`forward_grid`にNaN/Infのファイアウォール(`nan_to_num`)を追加
+  - `train.py`の`CUDA_VISIBLE_DEVICES`自動選択(起動時に最も空いているGPUを選ぶ処理)が、明示的に`--gpu`を指定した場合でも無条件に実行されていたバグを修正。2つのジョブをほぼ同時に起動すると、運悪く同じ物理GPUを選んでしまい競合することがありました
+  - 学習終了時の`evaluate()`(LPIPS計算)の直前に`torch.cuda.empty_cache()`を追加。学習ループの未解放メモリが原因のOOMクラッシュに対処
+- `arithmetic_coding.py`/`entropy_models.py`/`octree_coding.py`: 2成分ガウス混合事前分布の実際の算術符号化(`encode_gaussian_mixed`等)と、オクツリーマスクのコンテキスト条件付きビット推定を追加
