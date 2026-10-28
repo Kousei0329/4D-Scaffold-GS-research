@@ -932,9 +932,10 @@ void grid_encode_forward_cuda(
         case 1: kernel_grid_wrapper<scalar_t, 1>(inputs, embeddings, offsets_list, resolutions_list, outputs, N, n_fearures, n_levels, max_level, Rb, PV, dy_dx, binary_vxl, min_level_id); break;
         case 2: kernel_grid_wrapper<scalar_t, 2>(inputs, embeddings, offsets_list, resolutions_list, outputs, N, n_fearures, n_levels, max_level, Rb, PV, dy_dx, binary_vxl, min_level_id); break;
         case 3: kernel_grid_wrapper<scalar_t, 3>(inputs, embeddings, offsets_list, resolutions_list, outputs, N, n_fearures, n_levels, max_level, Rb, PV, dy_dx, binary_vxl, min_level_id); break;
-        // case 4: kernel_grid_wrapper<scalar_t, 4>(inputs, embeddings, offsets_list, resolutions_list, outputs, N, n_fearures, n_levels, max_level, Rb, PV, dy_dx, binary_vxl, min_level_id); break;
+        // Joint 4D (x,y,z,t) hash grid ablation -- see scene/gaussian_model.py use_joint_4d_hash.
+        case 4: kernel_grid_wrapper<scalar_t, 4>(inputs, embeddings, offsets_list, resolutions_list, outputs, N, n_fearures, n_levels, max_level, Rb, PV, dy_dx, binary_vxl, min_level_id); break;
         // case 5: kernel_grid_wrapper<scalar_t, 5>(inputs, embeddings, offsets_list, resolutions_list, outputs, N, n_fearures, n_levels, max_level, Rb, PV, dy_dx, binary_vxl, min_level_id); break;
-        default: throw std::runtime_error{"GridEncoding: num_dim must be 1, 2, 3."};
+        default: throw std::runtime_error{"GridEncoding: num_dim must be 1, 2, 3, 4."};
     }
 }
 
@@ -1009,9 +1010,9 @@ void grid_encode_backward_cuda(
         case 1: kernel_grid_backward_wrapper<scalar_t, 1>(grad, inputs, embeddings, offsets_list, resolutions_list, grad_embeddings, N, n_fearures, n_levels, max_level, Rb, dy_dx, grad_inputs, binary_vxl, min_level_id); break;
         case 2: kernel_grid_backward_wrapper<scalar_t, 2>(grad, inputs, embeddings, offsets_list, resolutions_list, grad_embeddings, N, n_fearures, n_levels, max_level, Rb, dy_dx, grad_inputs, binary_vxl, min_level_id); break;
         case 3: kernel_grid_backward_wrapper<scalar_t, 3>(grad, inputs, embeddings, offsets_list, resolutions_list, grad_embeddings, N, n_fearures, n_levels, max_level, Rb, dy_dx, grad_inputs, binary_vxl, min_level_id); break;
-        // case 4: kernel_grid_backward_wrapper<scalar_t, 4>(grad, inputs, embeddings, offsets_list, resolutions_list, grad_embeddings, N, n_fearures, n_levels, max_level, Rb, dy_dx, grad_inputs, binary_vxl, min_level_id); break;
+        case 4: kernel_grid_backward_wrapper<scalar_t, 4>(grad, inputs, embeddings, offsets_list, resolutions_list, grad_embeddings, N, n_fearures, n_levels, max_level, Rb, dy_dx, grad_inputs, binary_vxl, min_level_id); break;
         // case 5: kernel_grid_backward_wrapper<scalar_t, 5>(grad, inputs, embeddings, offsets_list, resolutions_list, grad_embeddings, N, n_fearures, n_levels, max_level, Rb, dy_dx, grad_inputs, binary_vxl, min_level_id); break;
-        default: throw std::runtime_error{"GridEncoding: num_dim must be 1, 2, 3."};
+        default: throw std::runtime_error{"GridEncoding: num_dim must be 1, 2, 3, 4."};
     }
 }
 

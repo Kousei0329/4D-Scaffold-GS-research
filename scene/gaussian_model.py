@@ -10,6 +10,7 @@
 #
 
 import torch
+import math
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max
@@ -23,20 +24,112 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
 from utils.encodings import GridEncoder, STE_binary, STE_multistep, anchor_round_digits
-from utils.entropy_models import Entropy_gaussian, get_binary_vxl_size
+from utils.entropy_models import Entropy_gaussian, Entropy_gaussian_mix_prob_2, get_binary_vxl_size
 from utils.arithmetic_coding import encode_gaussian_chunk as encode_gaussian, decode_gaussian_chunk as decode_gaussian
+from utils.arithmetic_coding import encode_gaussian_mixed_chunk, decode_gaussian_mixed_chunk
+from utils.arithmetic_coding import encode_gaussian_mixed, decode_gaussian_mixed
+from utils.arithmetic_coding import fit_gmm_1d_2comp
 from utils.arithmetic_coding import encode_binary, decode_binary
 from utils.octree_coding import encode_positions, decode_positions
 
-# 4D anchor axes are (x, y, z, t). Since the existing 3D hash-grid CUDA kernel
-# (ported from HAC) can't be fed 4D coordinates directly, we decompose the 4D
-# anchor position into every 3-axis combination and run one 3D GridEncoder per
-# combination, then concatenate their outputs as the context feature.
+# 4D anchor axes are (x, y, z, t). Default design: decompose the 4D anchor position into
+# every 3-axis combination and run one 3D GridEncoder per combination, then concatenate
+# their outputs as the context feature (K-Planes/HexPlane-style factorization; the existing
+# 3D hash-grid CUDA kernel ported from HAC only supported num_dim<=3 when this was written).
 HASH_TRIPLETS = [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]  # xyz, xyt, xzt, yzt
+
+# Ablation: use_joint_4d_hash=True replaces the 4 factored 3D encoders above with a single
+# GridEncoder(num_dim=4) hashing (x,y,z,t) jointly -- a true 4D hash grid rather than a
+# triplet decomposition. num_dim=4 support was added to submodules/gridencoder's CUDA kernel
+# (previously commented out, num_dim<=3 only) specifically for this. Same hash_n_features /
+# hash_log2_size per table as the triplet mode, so this compares "1 joint 4D table" against
+# "4 factored 3D tables" at equal per-table capacity, not equal total capacity.
+
+# Ablation: use_hybrid_4d_hash=True combines a joint 4D table (xyzt) with a dedicated xyz-only
+# 3D table -- the 4D table supplies spatiotemporal coupling, the xyz table supplies spatial
+# detail the 4D table can't afford at equal hash_log2_size (see HYBRID_4D_RESOLUTIONS below).
+#
+# A GridEncoder's per-level hash table saturates its log2_hashmap_size cap once
+# resolution**num_dim exceeds 2**log2_hashmap_size -- resolution ~27 for num_dim=4 vs ~81 for
+# num_dim=3 at the default log2_hashmap_size=19. Past that point every extra level of the
+# default 12-level schedule (16..736) is oversubscribed by an ever-growing factor (2x at R=32,
+# up to ~560,000x at R=736) -- almost pure hash collision with negligible new information, while
+# still costing mlp_grid an extra n_features-wide input slice. The joint 4D table therefore uses
+# a shortened schedule that stops before that regime (through R=128, ~512x oversubscribed) --
+# the xyz-only table keeps the original 12-level schedule since num_dim=3 doesn't saturate until
+# much higher up.
+HYBRID_4D_RESOLUTIONS = (16, 23, 32, 46, 64, 92, 128)
 
 # Initial logit for the learnable per-anchor rate-distortion mask (sigmoid(2.0) ~= 0.88):
 # anchors start "mostly open" so useful ones aren't killed before they prove useful.
 MASK_INIT_LOGIT = 2.0
+
+
+class ChannelCtxFeat(nn.Module):
+    """Intra-anchor context model for anchor_feat: splits feat_dim into n_groups equal
+    channel groups and predicts each group's (mean_adj, scale_adj, prob_adj) from the
+    already-known groups of the SAME anchor (channels before it) plus the hash-grid's own
+    per-channel (mean, scale, prob) for the whole attribute. Ported from HAC++'s
+    scene/gaussian_model.py Channel_CTX_fea, generalized from its fixed 5x10 split (for
+    HAC++'s feat_dim=50) to n_groups equal groups so it works with this fork's feat_dim=32
+    default (4 groups of 8).
+
+    forward() with to_dec=-1 computes all n_groups from the TRUE (already quantized)
+    feat_q -- used during training, where the whole rate loss must be differentiable and
+    every group's ground truth is already available as context (teacher forcing). With
+    to_dec=cc it returns only group cc's (mean_adj, scale_adj, prob_adj), computed from
+    groups [0, cc) of feat_q only -- used during real encode/decode, which must reproduce
+    this exact ordering since the decoder doesn't have groups >= cc yet (the caller passes
+    a feat_q whose groups >= cc are unused placeholders).
+
+    Tried the same scheme for `offsets` (one group per child-Gaussian's (x,y,z,t) slot,
+    conditioning later slots on earlier ones within the same anchor) and reverted it:
+    offsets are ~87-90% inactive per anchor (see conduct_encoding's active-slot
+    filtering), so most groups carry near-zero context to pass on, and the extra
+    per-group MLP + bitstream-file overhead measured a net LARGER compressed size on
+    average across a 5-lambda sweep (worst case +17% at the sparsest anchor counts) --
+    not worth it for this attribute, unlike feat which is dense and always populated."""
+
+    def __init__(self, feat_dim, n_groups=4):
+        super().__init__()
+        assert feat_dim % n_groups == 0, \
+            f"ChannelCtxFeat needs feat_dim ({feat_dim}) divisible by n_groups ({n_groups})"
+        self.feat_dim = feat_dim
+        self.n_groups = n_groups
+        self.group_size = feat_dim // n_groups
+        self.mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(3 * feat_dim + self.group_size * i, 2 * self.group_size),
+                nn.LeakyReLU(inplace=True),
+                nn.Linear(2 * self.group_size, 3 * self.group_size),
+            )
+            for i in range(n_groups)
+        ])
+
+    def forward(self, feat_q, mean_scale_prob, to_dec=-1):
+        groups = torch.split(feat_q, self.group_size, dim=-1)
+        prior_groups = []
+        means, scales, probs = [], [], []
+        for i, mlp in enumerate(self.mlps):
+            inp = torch.cat(prior_groups + [mean_scale_prob], dim=-1)
+            mean_i, scale_i, prob_i = torch.chunk(mlp(inp), chunks=3, dim=-1)
+            # Same NaN/Inf firewall as forward_grid (see its comment) -- this MLP's
+            # output feeds entropy_gaussian_mix's second component independently of
+            # forward_grid's, so it needs its own guard against the same failure mode
+            # (confirmed in practice: a late-training, high-lambda run crashed here with
+            # Normal's scale constraint violated, from an unsanitized scale_i).
+            mean_i = torch.nan_to_num(mean_i, nan=0.0, posinf=1e4, neginf=-1e4)
+            scale_i = torch.nan_to_num(scale_i, nan=0.0, posinf=1e4, neginf=-1e4)
+            prob_i = torch.nan_to_num(prob_i, nan=0.0, posinf=1e4, neginf=-1e4)
+            if to_dec == i:
+                return mean_i, scale_i, prob_i
+            means.append(mean_i)
+            scales.append(scale_i)
+            probs.append(prob_i)
+            prior_groups.append(groups[i])
+        if to_dec != -1:
+            raise ValueError(f"to_dec={to_dec} out of range for n_groups={self.n_groups}")
+        return torch.cat(means, dim=-1), torch.cat(scales, dim=-1), torch.cat(probs, dim=-1)
 
 
 class GaussianModel:
@@ -84,7 +177,15 @@ class GaussianModel:
                  hash_log2_size : int = 19,
                  noise_start_iter : int = 3_000,
                  entropy_start_iter : int = 10_000,
+                 use_intra_anchor_context : bool = False,
+                 use_joint_4d_hash : bool = False,
+                 use_hybrid_4d_hash : bool = False,
+                 use_full_hybrid_4d_hash : bool = False,
+                 motion_model : str = 'linear',
+                 motion_basis_dim : int = 16,
                  ):
+        assert sum([use_joint_4d_hash, use_hybrid_4d_hash, use_full_hybrid_4d_hash]) <= 1, \
+            "use_joint_4d_hash, use_hybrid_4d_hash and use_full_hybrid_4d_hash are mutually exclusive hash-grid ablations"
 
         self.feat_dim = feat_dim
         self.n_offsets = n_offsets
@@ -112,12 +213,25 @@ class GaussianModel:
         self.use_entropy_coding = use_entropy_coding
         self.noise_start_iter = noise_start_iter
         self.entropy_start_iter = entropy_start_iter
+        self.use_intra_anchor_context = use_intra_anchor_context
+        self.use_joint_4d_hash = use_joint_4d_hash
+        self.use_hybrid_4d_hash = use_hybrid_4d_hash
+        self.use_full_hybrid_4d_hash = use_full_hybrid_4d_hash
+        self.motion_model = motion_model
+        self.motion_basis_dim = motion_basis_dim
 
         self._anchor = torch.empty(0)
+        # Mip-Splatting-style 3D smoothing filter: per-anchor variance floor so a Gaussian
+        # can't render thinner than the finest world-space pixel footprint any TRAINING
+        # camera could actually resolve for it (see compute_3D_filter). Not a learned
+        # parameter and not entropy-coded -- deterministically recomputed from anchor
+        # position + the (fixed) training camera set, same category as rotation/flow.
+        self.filter_3D = torch.empty(0)
         self._offset = torch.empty(0)
         self._anchor_feat = torch.empty(0)
         
         self.opacity_accum = torch.empty(0)
+        self.mask_val_accum = torch.empty(0)
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -125,6 +239,19 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         
         self.offset_gradient_accum = torch.empty(0)
+        # Parallel accumulator for the photometric-error densification signal (see
+        # anchor_growing): per-visit rendered-vs-GT L1 error sampled at this offset's
+        # projected screen location, averaged the same way as offset_gradient_accum.
+        self.photo_error_accum = torch.empty(0)
+        # Parallel accumulator for the flow-magnitude densification signal (see
+        # anchor_growing's flow_mask): per-visit motion speed (flow[:, :3].norm()) at this
+        # offset, averaged the same way as offset_gradient_accum/photo_error_accum. Lets
+        # anchor_growing grow offsets in fast-moving regions even when their screen-space
+        # gradient doesn't cross densify_grad_threshold -- the motion-blur problem this
+        # targets showed up specifically as under-resolved detail in fast-moving regions,
+        # not slow/static ones, so gradient alone (which responds to appearance error, not
+        # motion per se) can miss it.
+        self.flow_speed_accum = torch.empty(0)
         self.offset_time_accum = torch.empty(0)
         self.offset_denom = torch.empty(0)
         self.offset_time_denom = torch.empty(0)
@@ -168,31 +295,120 @@ class GaussianModel:
             nn.Sigmoid()
         ).cuda()
 
-        self.mlp_flow = nn.Sequential(
-            nn.Linear(feat_dim, feat_dim),
-            nn.ReLU(True),
-            # nn.Linear(feat_dim, 12*self.n_offsets),
-            nn.Linear(feat_dim, 3*self.n_offsets),
-            nn.Tanh()
-        ).cuda()
+        # Motion model ablation (see arguments/__init__.py's motion_model docstring for the
+        # full rationale of each option). In every case mlp_flow stays a feat-only ->
+        # per-offset-coefficients network computed once per anchor (same as the original
+        # velocity-only model), traceable/saveable exactly like before; only its output
+        # width changes. 'basis' and 'taylor_residual' additionally need a dt-dependent
+        # shared time-basis Phi(dt), computed separately at render time (see
+        # generate_neural_gaussians / render()) since dt is only known after per-camera,
+        # per-timestamp masking -- mlp_time_basis holds that piece. 'fourier' needs no
+        # learned time module: Phi(dt) is a fixed sin/cos harmonic basis computed in the
+        # renderer directly from motion_fourier_freqs.
+        B = self.motion_basis_dim
+        if self.motion_model == 'linear':
+            self.mlp_flow = nn.Sequential(
+                nn.Linear(feat_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3*self.n_offsets),
+                nn.Tanh()
+            ).cuda()
+        elif self.motion_model == 'basis':
+            self.mlp_flow = nn.Sequential(
+                nn.Linear(feat_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3*B*self.n_offsets),
+                nn.Tanh()
+            ).cuda()
+            self.mlp_time_basis = nn.Sequential(
+                nn.Linear(1, 64),
+                nn.ReLU(True),
+                nn.Linear(64, B),
+                nn.Tanh()
+            ).cuda()
+        elif self.motion_model == 'fourier':
+            self.mlp_flow = nn.Sequential(
+                nn.Linear(feat_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3*B*self.n_offsets),
+                nn.Tanh()
+            ).cuda()
+            n_harmonics = B // 2
+            # Scene clips span ~10s (time_duration default [0, 10]); harmonics span that
+            # fundamental period so the fixed basis covers the observed dt range.
+            self.motion_fourier_freqs = (2 * torch.pi * torch.arange(1, n_harmonics + 1, dtype=torch.float32) / 10.0).cuda()
+        elif self.motion_model == 'taylor_residual':
+            B_res = B // 2
+            self.mlp_flow = nn.Sequential(
+                nn.Linear(feat_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, (9 + 3*B_res)*self.n_offsets),
+                nn.Tanh()
+            ).cuda()
+            self.mlp_time_basis = nn.Sequential(
+                nn.Linear(1, 64),
+                nn.ReLU(True),
+                nn.Linear(64, B_res),
+                nn.Tanh()
+            ).cuda()
+        else:
+            raise ValueError(f"unknown motion_model {self.motion_model!r}")
 
         if self.use_entropy_coding:
             self.x_bound_min = torch.zeros((1, 4), device="cuda")
             self.x_bound_max = torch.ones((1, 4), device="cuda")
             self.bounds_ready = False
 
-            self.encoding_xyz = nn.ModuleList([
-                GridEncoder(num_dim=3, n_features=hash_n_features, log2_hashmap_size=hash_log2_size,
-                            ste_binary=True, ste_multistep=False, add_noise=False, Q=1)
-                for _ in HASH_TRIPLETS
-            ]).cuda()
+            if self.use_full_hybrid_4d_hash:
+                # 4D joint table (shortened schedule) + all 4 original 3D triplet tables --
+                # the "everything" ablation point: does stacking the factored triplets ON TOP
+                # of the joint table help, or is the joint table's own spatiotemporal coupling
+                # already redundant with them (as use_hybrid_4d_hash's single xyz table
+                # suggested)?
+                self.encoding_xyz = nn.ModuleList([
+                    GridEncoder(num_dim=4, n_features=hash_n_features, log2_hashmap_size=hash_log2_size,
+                                resolutions_list=HYBRID_4D_RESOLUTIONS,
+                                ste_binary=True, ste_multistep=False, add_noise=False, Q=1),
+                ] + [
+                    GridEncoder(num_dim=3, n_features=hash_n_features, log2_hashmap_size=hash_log2_size,
+                                ste_binary=True, ste_multistep=False, add_noise=False, Q=1)
+                    for _ in HASH_TRIPLETS
+                ]).cuda()
+            elif self.use_hybrid_4d_hash:
+                self.encoding_xyz = nn.ModuleList([
+                    GridEncoder(num_dim=4, n_features=hash_n_features, log2_hashmap_size=hash_log2_size,
+                                resolutions_list=HYBRID_4D_RESOLUTIONS,
+                                ste_binary=True, ste_multistep=False, add_noise=False, Q=1),
+                    GridEncoder(num_dim=3, n_features=hash_n_features, log2_hashmap_size=hash_log2_size,
+                                ste_binary=True, ste_multistep=False, add_noise=False, Q=1),
+                ]).cuda()
+            elif self.use_joint_4d_hash:
+                self.encoding_xyz = nn.ModuleList([
+                    GridEncoder(num_dim=4, n_features=hash_n_features, log2_hashmap_size=hash_log2_size,
+                                ste_binary=True, ste_multistep=False, add_noise=False, Q=1)
+                ]).cuda()
+            else:
+                self.encoding_xyz = nn.ModuleList([
+                    GridEncoder(num_dim=3, n_features=hash_n_features, log2_hashmap_size=hash_log2_size,
+                                ste_binary=True, ste_multistep=False, add_noise=False, Q=1)
+                    for _ in HASH_TRIPLETS
+                ]).cuda()
 
-            hash_feat_dim = self.encoding_xyz[0].output_dim * len(HASH_TRIPLETS)
+            # NOTE: sum(), not output_dim * len(...) -- the hybrid mode's two tables have
+            # different level counts (HYBRID_4D_RESOLUTIONS has 7 levels vs the xyz table's
+            # 12), so their output_dim differs and can't be assumed uniform across tables.
+            hash_feat_dim = sum(encoder.output_dim for encoder in self.encoding_xyz)
             # mlp_grid predicts a per-anchor Gaussian (mean, scale) for each entropy-coded
             # attribute: anchor_feat (feat_dim), scaling (8-dim), offsets (4*n_offsets-dim),
             # plus one adaptive-quantization-step adjustment logit per attribute group.
             # anchor position (x,y,z,t) itself and mlp_flow / temporal sigma are NOT coded here.
-            grid_out_dim = 2 * feat_dim + 2 * 8 + 2 * (4 * self.n_offsets) + 3
+            # With intra-anchor context enabled, anchor_feat additionally gets a per-channel
+            # prob_feat output: the mixing weight (pre-softmax logit) between this hash-grid
+            # (inter-anchor) Gaussian and the intra-anchor MLP's adjustment -- see
+            # ChannelCtxFeat and Entropy_gaussian_mix_prob_2.
+            grid_out_dim = 2 * feat_dim + 2 * 7 + 2 * (4 * self.n_offsets) + 3
+            if self.use_intra_anchor_context:
+                grid_out_dim += feat_dim
             self.mlp_grid = nn.Sequential(
                 nn.Linear(hash_feat_dim, feat_dim * 2),
                 nn.ReLU(True),
@@ -201,20 +417,36 @@ class GaussianModel:
 
             self.entropy_gaussian = Entropy_gaussian(Q=1).cuda()
 
+            if self.use_intra_anchor_context:
+                self.mlp_channel_ctx = ChannelCtxFeat(feat_dim, n_groups=4).cuda()
+                self.entropy_gaussian_mix = Entropy_gaussian_mix_prob_2(Q=1).cuda()
+
     def calc_interp_feat(self, x):
         # x: [N, 4] anchor positions (x, y, z, t)
         assert len(x.shape) == 2 and x.shape[1] == 4
         x = (x - self.x_bound_min) / (self.x_bound_max - self.x_bound_min)  # -> [0, 1]
-        feats = [encoder(x[:, triplet]) for encoder, triplet in zip(self.encoding_xyz, HASH_TRIPLETS)]
+        if self.use_full_hybrid_4d_hash:
+            feats = [self.encoding_xyz[0](x)] + \
+                [encoder(x[:, triplet]) for encoder, triplet in zip(self.encoding_xyz[1:], HASH_TRIPLETS)]
+        elif self.use_hybrid_4d_hash:
+            feats = [self.encoding_xyz[0](x), self.encoding_xyz[1](x[:, :3])]
+        elif self.use_joint_4d_hash:
+            feats = [self.encoding_xyz[0](x)]
+        else:
+            feats = [encoder(x[:, triplet]) for encoder, triplet in zip(self.encoding_xyz, HASH_TRIPLETS)]
         return torch.cat(feats, dim=-1)
 
     def forward_grid(self, feat_context):
         y = self.mlp_grid(feat_context)
-        return torch.split(
-            y,
-            [self.feat_dim, self.feat_dim, 8, 8, 4 * self.n_offsets, 4 * self.n_offsets, 1, 1, 1],
-            dim=-1,
-        )
+        # Firewall against NaN/Inf propagating into the entropy-coding mean/scale/Q
+        # predictions (seen in practice at low lambda, where weaker rate regularization
+        # lets some intermediate value drift until a log/division blows up) -- a no-op
+        # on already-finite values, so this changes nothing for any already-validated run.
+        y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
+        sizes = [self.feat_dim, self.feat_dim, 7, 7, 4 * self.n_offsets, 4 * self.n_offsets, 1, 1, 1]
+        if self.use_intra_anchor_context:
+            sizes.append(self.feat_dim)
+        return torch.split(y, sizes, dim=-1)
 
     @staticmethod
     def adaptive_Q(Q_base, Q_adj):
@@ -224,6 +456,25 @@ class GaussianModel:
         # call. A Q allowed to collapse toward 0 for even a single element can blow that
         # range up by orders of magnitude and OOM the whole batch, so Q is kept within a
         # bounded ratio of Q_base rather than letting tanh saturate all the way to -1.
+        #
+        # The ceiling (tanh saturating at +1) looks like an unintentional artifact rather
+        # than a deliberate choice -- and on a real checkpoint, Q does sit pinned at
+        # exactly this ceiling for ~100% of elements across feat/scaling/offsets alike.
+        # But removing it is NOT a free win: both tried fixes (raising Q_base 4x with this
+        # same tanh formula, and switching to a non-saturating softplus formula at the
+        # ORIGINAL Q_base) collapsed to the same catastrophic ~16.7dB PSNR (vs ~28dB
+        # normal) on an otherwise-identical smoke test, with feat's coded size shrinking
+        # to near-nothing (~0.03-0.04MB vs ~0.65-0.9MB) -- i.e. feat gets quantized away
+        # almost entirely. That rules out "Q_base was just too large" as the explanation:
+        # the failure reproduced at the original Q_base too, under a different
+        # non-saturating formula. The real cause looks like a one-sided imbalance between
+        # the rate loss's gradient (pushes Q up, direct and strong) and the distortion
+        # loss's gradient on Q (indirect, via STE noise, and apparently too weak to push
+        # back at this scale) -- meaning tanh's vanishing gradient at saturation was
+        # doing useful, unintentional work as a brake, not merely limiting an otherwise-
+        # fine equilibrium. Left as tanh/[0.1x, 2x] rather than revisiting this without a
+        # fix for that underlying rate/distortion gradient imbalance (e.g. a separate,
+        # slower learning rate for Q_adj, or a warm-up schedule for the allowed range).
         return torch.clamp(Q_base * (1 + torch.tanh(Q_adj)), min=Q_base * 0.1)
 
     def get_encoding_params(self):
@@ -268,6 +519,28 @@ class GaussianModel:
         # "kept" falls below mask_prune_threshold are candidates for physical pruning.
         return torch.sigmoid(self._mask_anchor)
 
+    @torch.no_grad()
+    def compute_3D_filter(self, cameras):
+        # Mip-Splatting-style 3D smoothing filter: a per-anchor variance floor set from
+        # the finest world-space pixel footprint any TRAINING camera could actually resolve
+        # at that anchor's location. Prevents a Gaussian from shrinking thinner than every
+        # camera's sampling rate can support (the source of aliasing/erosion under
+        # out-of-distribution test views/zooms). Deterministic given anchor position + the
+        # fixed training camera set -- recompute whenever the anchor set changes (same
+        # cadence as adjust_anchor's growing/pruning) to stay shape-consistent.
+        xyz = self.get_anchor[:, :3]
+        min_sampling = torch.full((xyz.shape[0],), float('inf'), device="cuda")
+        for cam in cameras:
+            dist = (xyz - cam.camera_center.to(xyz.device)).norm(dim=-1).clamp(min=1e-6)
+            focal_x = cam.image_width / (2 * math.tan(cam.FoVx * 0.5))
+            focal_y = cam.image_height / (2 * math.tan(cam.FoVy * 0.5))
+            focal = min(focal_x, focal_y)
+            sampling = dist / focal
+            min_sampling = torch.min(min_sampling, sampling)
+        # variance-equivalent floor, in world units, mirroring the de facto
+        # "+0.3 pixel dilation" convention used across 3DGS forks.
+        self.filter_3D = (min_sampling * 0.2) ** 2
+
     def update_anchor_bound(self):
         x_bound_min = (torch.min(self._anchor, dim=0, keepdim=True)[0]).detach()
         x_bound_max = (torch.max(self._anchor, dim=0, keepdim=True)[0]).detach()
@@ -298,8 +571,12 @@ class GaussianModel:
             offsets = self._offset[keep].reshape(N, -1)
 
             feat_context = self.calc_interp_feat(anchor)
-            mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
-                Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
+            if self.use_intra_anchor_context:
+                mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                    Q_feat_adj, Q_scaling_adj, Q_offsets_adj, prob_feat = self.forward_grid(feat_context)
+            else:
+                mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                    Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
 
             Q_feat = self.adaptive_Q(1.0, Q_feat_adj)
             Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj)
@@ -309,8 +586,20 @@ class GaussianModel:
             scaling_q = STE_multistep.apply(scaling, Q_scaling, scaling.mean())
             offsets_q = STE_multistep.apply(offsets, Q_offsets, offsets.mean())
 
-            bit_feat = torch.sum(self.entropy_gaussian(feat_q, mean_feat, scale_feat, Q_feat)).item()
+            if self.use_intra_anchor_context:
+                mean_adj, scale_adj, prob_adj = self.mlp_channel_ctx(
+                    feat_q, torch.cat([mean_feat, scale_feat, prob_feat], dim=-1))
+                probs = torch.softmax(torch.stack([prob_feat, prob_adj], dim=-1), dim=-1)
+                bit_feat = torch.sum(self.entropy_gaussian_mix(
+                    feat_q, mean_feat, mean_adj, scale_feat, scale_adj,
+                    probs[..., 0], probs[..., 1], Q_feat)).item()
+            else:
+                bit_feat = torch.sum(self.entropy_gaussian(feat_q, mean_feat, scale_feat, Q_feat)).item()
             bit_scaling = torch.sum(self.entropy_gaussian(scaling_q, mean_scaling, scale_scaling, Q_scaling)).item()
+            # NOTE: offsets rate here is still the single-Gaussian estimate (not the
+            # channel-context mixture actually used by conduct_encoding) -- this function
+            # is a logging-only approximation, not the real bit_per_param training loss or
+            # the real bitstream, so the mismatch doesn't affect correctness anywhere.
             bit_offsets = torch.sum(self.entropy_gaussian(offsets_q, mean_offsets, scale_offsets, Q_offsets)).item()
             bit_anchor_placeholder = N * 4 * anchor_round_digits
 
@@ -349,6 +638,20 @@ class GaussianModel:
         4D hyperoctree (utils/octree_coding.py); rotation and opacity are not per-anchor data
         at all (see below). Returns a bit-size report dict."""
         os.makedirs(path, exist_ok=True)
+        # Clear any bitstream files from a PREVIOUS call on this same path first. The
+        # chunked coders (encode_gaussian_chunk etc.) name files offsets_0.b, offsets_1.b,
+        # ... up to however many chunks THIS call needs; re-encoding in place (e.g. after
+        # a code change that shrinks the data, as happened when offsets filtering was
+        # added) writes fewer/smaller chunks than before, but never deletes the old
+        # chunks that are no longer needed -- they silently survive as stale leftovers,
+        # inflating the directory's real size far beyond what this call's own byte counts
+        # (bits_feat/bits_scaling/bits_offsets) report. Caught in practice: re-running
+        # this on an already-encoded checkpoint left ~2200 stale offsets_*.b chunk files
+        # from before offsets filtering shrank the chunk count to ~34.
+        for fname in os.listdir(path):
+            if fname == 'uncoded_attrs.pt' or fname == 'anchor_geom.b' or \
+               fname.startswith(('feat', 'scaling', 'offsets', 'mask')):
+                os.remove(os.path.join(path, fname))
         bit2MB_scale = 8 * 1024 * 1024
         byte2MB_scale = 1024 * 1024
         with torch.no_grad():
@@ -357,6 +660,38 @@ class GaussianModel:
             feat = self._anchor_feat[keep]
             scaling = self.get_scaling[keep]
             offsets = self._offset[keep].reshape(anchor.shape[0], -1)
+
+            # Drop anchors whose every child-offset slot is inactive (neural_opacity<=0
+            # for all n_offsets) -- training's accumulated opacity_accum pruning (see
+            # adjust_anchor) already removes most such anchors, but that's an AVERAGE
+            # over many past visits/timesteps, so a handful can still have zero active
+            # slots at this EXACT final feat value (measured ~0.04% of anchors on a real
+            # checkpoint) and slip through to the final checkpoint. These contribute
+            # feat/scaling/position bits for literally nothing rendered, and -- same
+            # argument as the keep-mask above -- dropping them needs no side info: the
+            # decoder recomputes the identical "nothing here" fact from feat alone.
+            # Checked here, before geometry gets encoded, so these anchors are excluded
+            # from anchor_geom.b too, not just from feat/scaling/offsets.
+            assert not self.add_opacity_dist, \
+                "dead-anchor pruning assumes neural_opacity depends only on feat, not view direction/distance"
+            has_active_offset = (self.get_opacity_mlp(feat) > 0.0).any(dim=1)
+            anchor, feat, scaling, offsets = (
+                anchor[has_active_offset], feat[has_active_offset],
+                scaling[has_active_offset], offsets[has_active_offset])
+            # rotation/opacity/mask below are re-sliced from self.* directly (not derived
+            # from the already-filtered anchor/feat/scaling/offsets above), so they need
+            # this SAME combined filter -- scatter has_active_offset (defined in the
+            # keep-subspace) back into the full anchor-index space so `keep` alone can't
+            # be reused by accident. Using plain `keep` for rotation/opacity/mask_soft
+            # while anchor/feat/scaling/offsets used `keep & has_active_offset` was a real
+            # bug: it gave those three tensors ~0.04% MORE rows than inv_perm's length,
+            # so indexing with inv_perm silently pulled values from the wrong anchors
+            # instead of erroring -- confirmed by direct measurement to corrupt
+            # mask_anchor (which gates render-time opacity for every anchor, not just the
+            # dropped ones) enough to cost ~7dB of PSNR on a real checkpoint.
+            keep_prev = keep
+            keep = keep.clone()
+            keep[keep_prev] = has_active_offset
 
             # Entropy-code anchor geometry first, then reorder every other per-anchor
             # attribute into that same canonical order -- decode_positions always returns
@@ -372,23 +707,65 @@ class GaussianModel:
             N = anchor.shape[0]
 
             feat_context = self.calc_interp_feat(anchor)
-            mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
-                Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
+            if self.use_intra_anchor_context:
+                mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                    Q_feat_adj, Q_scaling_adj, Q_offsets_adj, prob_feat = self.forward_grid(feat_context)
+            else:
+                mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                    Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
 
             Q_feat = self.adaptive_Q(1.0, Q_feat_adj).expand(N, self.feat_dim).contiguous()
-            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj).expand(N, 8).contiguous()
+            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj).expand(N, 7).contiguous()
             Q_offsets = self.adaptive_Q(0.2, Q_offsets_adj).expand(N, 4 * self.n_offsets).contiguous()
 
             feat_q = STE_multistep.apply(feat, Q_feat, feat.mean())
             scaling_q = STE_multistep.apply(scaling, Q_scaling, scaling.mean())
             offsets_q = STE_multistep.apply(offsets, Q_offsets, offsets.mean())
 
-            bits_feat = encode_gaussian(feat_q.reshape(-1), mean_feat.reshape(-1), scale_feat.reshape(-1),
-                                         Q_feat.reshape(-1), os.path.join(path, 'feat.b'))
+            # HAC/HAC++ filter offsets down to only the per-offset slots that actually
+            # render something (neural_opacity > 0 -- the SAME criterion
+            # gaussian_renderer.generate_neural_gaussians uses to mask out unrendered
+            # child Gaussians) before arithmetic-coding them. Most slots are inactive
+            # (measured ~89% on a real checkpoint), so coding the full dense tensor wastes
+            # most of offsets.b's bits on values nothing ever renders. This needs NO side
+            # information: which slots are active is a deterministic function of feat_q
+            # alone (via mlp_opacity), which conduct_decoding reconstructs byte-identically
+            # from the losslessly-decoded feat -- valid only because add_opacity_dist=False
+            # (neural_opacity doesn't depend on view direction/distance, which the decoder
+            # has no camera to recompute anyway); if that ever changes, this filtering
+            # breaks and must be reverted to the dense scheme.
+            assert not self.add_opacity_dist, \
+                "offsets filtering assumes neural_opacity (and which offset slots are " \
+                "active) depends only on feat, not on view direction/distance"
+            offset_active = (self.get_opacity_mlp(feat_q) > 0.0)  # [N, n_offsets]
+            offset_active_flat = offset_active.unsqueeze(-1).expand(N, self.n_offsets, 4).reshape(N, -1)
+
+            if self.use_intra_anchor_context:
+                # Sequential per-channel-group encode: group cc's context (mean_adj,
+                # scale_adj, prob_adj) is predicted from feat_q's already-known groups
+                # [0, cc) of this SAME anchor -- conduct_decoding must reproduce this
+                # exact group order since it won't have feat_q's later groups yet.
+                gs = self.mlp_channel_ctx.group_size
+                mean_scale_prob = torch.cat([mean_feat, scale_feat, prob_feat], dim=-1)
+                bits_feat = 0
+                feat_b_name = os.path.join(path, 'feat.b')
+                for cc in range(self.mlp_channel_ctx.n_groups):
+                    sl = slice(cc * gs, (cc + 1) * gs)
+                    mean_adj, scale_adj, prob_adj = self.mlp_channel_ctx(feat_q, mean_scale_prob, to_dec=cc)
+                    probs = torch.softmax(torch.stack([prob_feat[:, sl], prob_adj], dim=-1), dim=-1)
+                    bits_feat += encode_gaussian_mixed_chunk(
+                        feat_q[:, sl].reshape(-1), mean_feat[:, sl].reshape(-1), mean_adj.reshape(-1),
+                        scale_feat[:, sl].reshape(-1), scale_adj.reshape(-1),
+                        probs[..., 0].reshape(-1), probs[..., 1].reshape(-1), Q_feat[:, sl].reshape(-1),
+                        feat_b_name.replace('.b', f'_g{cc}.b'))
+            else:
+                bits_feat = encode_gaussian(feat_q.reshape(-1), mean_feat.reshape(-1), scale_feat.reshape(-1),
+                                             Q_feat.reshape(-1), os.path.join(path, 'feat.b'))
             bits_scaling = encode_gaussian(scaling_q.reshape(-1), mean_scaling.reshape(-1), scale_scaling.reshape(-1),
                                             Q_scaling.reshape(-1), os.path.join(path, 'scaling.b'))
-            bits_offsets = encode_gaussian(offsets_q.reshape(-1), mean_offsets.reshape(-1), scale_offsets.reshape(-1),
-                                            Q_offsets.reshape(-1), os.path.join(path, 'offsets.b'))
+            bits_offsets = encode_gaussian(offsets_q[offset_active_flat], mean_offsets[offset_active_flat],
+                                            scale_offsets[offset_active_flat], Q_offsets[offset_active_flat],
+                                            os.path.join(path, 'offsets.b'))
 
             # rotation/opacity are NOT stored per-anchor at all: create_from_pcd and
             # anchor_growing always initialize every anchor to the same frozen
@@ -408,24 +785,55 @@ class GaussianModel:
             # dampens their rendered opacity. Losing that and treating every kept anchor as
             # "fully open" on decode reintroduces exactly the anchors training learned to
             # mostly (not entirely) suppress, at full strength -- a real, measured source of
-            # a ~10dB PSNR drop between the uncompressed and decoded models. 1 byte/anchor is
-            # cheap enough to store raw rather than build a dedicated entropy coder for it.
+            # a ~10dB PSNR drop between the uncompressed and decoded models.
             mask_soft = self.get_mask_anchor[keep][inv_perm].detach()
             mask_q = torch.round(mask_soft * 255).clamp(0, 255).to(torch.uint8)
+            mask_q_f = mask_q.float().view(-1)
+
+            # Entropy-code mask_q itself instead of storing it raw (flat 8 bits/anchor).
+            # Its empirical distribution is heavily right-skewed -- most survivors sit just
+            # above mask_prune_threshold, with a long tail toward 255 -- which a 2-component
+            # Gaussian mixture fits far better than a single Gaussian (measured ~27% smaller
+            # than the flat 8 bits/anchor on a real checkpoint, within a few percentage
+            # points of the empirical Shannon-entropy bound for the same data; a single
+            # Gaussian only gets ~16%). The mixture is fit fresh at encode time -- one
+            # GLOBAL model for the whole checkpoint, not a per-anchor hyper-network
+            # prediction -- so the only side info the decoder needs is its 6 scalars
+            # (2 means, 2 scales, 2 weights), saved below.
+            mask_means, mask_scales, mask_weights = fit_gmm_1d_2comp(mask_q_f)
+            mask_mean1 = mask_means[0].expand(N).contiguous()
+            mask_mean2 = mask_means[1].expand(N).contiguous()
+            mask_scale1 = mask_scales[0].expand(N).contiguous()
+            mask_scale2 = mask_scales[1].expand(N).contiguous()
+            mask_prob1 = mask_weights[0].expand(N).contiguous()
+            mask_prob2 = mask_weights[1].expand(N).contiguous()
+            # mean/scale are GLOBAL constants here (one fit for the whole checkpoint, not
+            # per-anchor), so x's quantized-symbol range is trivially bounded to [0,255] --
+            # no chunking needed for the int16/SAFE_RANGE safety the _chunk variants exist
+            # for (see utils/arithmetic_coding.py's chunking comment); one file is simpler
+            # and avoids the small per-chunk fixed-header overhead (32*3 bits/chunk).
+            bits_mask = encode_gaussian_mixed(
+                mask_q_f, mask_mean1, mask_mean2, mask_scale1, mask_scale2, mask_prob1, mask_prob2,
+                1.0, os.path.join(path, 'mask.b'))
 
             torch.save({
                 'anchor_mins': anchor_mins.cpu(),
-                'mask_q': mask_q.cpu(),
+                'mask_gmm_params': torch.stack([mask_means, mask_scales, mask_weights]).cpu(),  # [3, 2]
                 'rotation': (rotation[0:1] if rotation_is_constant else rotation).cpu(),
                 'rotation_is_constant': rotation_is_constant,
                 'opacity': (opacity[0:1] if opacity_is_constant else opacity).cpu(),
                 'opacity_is_constant': opacity_is_constant,
+                # Marks offsets.b as the filtered (active-slots-only) format -- lets
+                # conduct_decoding tell this apart from bitstreams written before offsets
+                # filtering existed, which coded the full dense tensor instead.
+                'offsets_filtered': True,
             }, os.path.join(path, 'uncoded_attrs.pt'))
 
             return {
                 'anchor_num': N,
                 'anchor_geom_MB': os.path.getsize(os.path.join(path, 'anchor_geom.b')) / byte2MB_scale,
-                'mask_MB': mask_q.numel() / byte2MB_scale,
+                'mask_MB': bits_mask / bit2MB_scale,
+                'offsets_active_frac': offset_active_flat.float().mean().item(),
                 'feat_MB': bits_feat / bit2MB_scale,
                 'scaling_MB': bits_scaling / bit2MB_scale,
                 'offsets_MB': bits_offsets / bit2MB_scale,
@@ -443,19 +851,60 @@ class GaussianModel:
             N = anchor.shape[0]
 
             feat_context = self.calc_interp_feat(anchor)
-            mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
-                Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
+            if self.use_intra_anchor_context:
+                mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                    Q_feat_adj, Q_scaling_adj, Q_offsets_adj, prob_feat = self.forward_grid(feat_context)
+            else:
+                mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
+                    Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
 
             Q_feat = self.adaptive_Q(1.0, Q_feat_adj).expand(N, self.feat_dim).contiguous()
-            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj).expand(N, 8).contiguous()
+            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj).expand(N, 7).contiguous()
             Q_offsets = self.adaptive_Q(0.2, Q_offsets_adj).expand(N, 4 * self.n_offsets).contiguous()
 
-            feat = decode_gaussian(mean_feat.reshape(-1), scale_feat.reshape(-1),
-                                    Q_feat.reshape(-1), os.path.join(path, 'feat.b')).view(N, self.feat_dim)
+            if self.use_intra_anchor_context:
+                # Sequential per-channel-group decode, mirroring conduct_encoding: group
+                # cc is decoded using groups [0, cc) already written into `feat` (group 0
+                # has no dependency, so the still-zero placeholder for groups >= cc is
+                # never read by ChannelCtxFeat's forward for to_dec=cc).
+                gs = self.mlp_channel_ctx.group_size
+                mean_scale_prob = torch.cat([mean_feat, scale_feat, prob_feat], dim=-1)
+                feat = torch.zeros(N, self.feat_dim, device=anchor.device)
+                feat_b_name = os.path.join(path, 'feat.b')
+                for cc in range(self.mlp_channel_ctx.n_groups):
+                    sl = slice(cc * gs, (cc + 1) * gs)
+                    mean_adj, scale_adj, prob_adj = self.mlp_channel_ctx(feat, mean_scale_prob, to_dec=cc)
+                    probs = torch.softmax(torch.stack([prob_feat[:, sl], prob_adj], dim=-1), dim=-1)
+                    feat[:, sl] = decode_gaussian_mixed_chunk(
+                        mean_feat[:, sl].reshape(-1), mean_adj.reshape(-1),
+                        scale_feat[:, sl].reshape(-1), scale_adj.reshape(-1),
+                        probs[..., 0].reshape(-1), probs[..., 1].reshape(-1), Q_feat[:, sl].reshape(-1),
+                        feat_b_name.replace('.b', f'_g{cc}.b')).view(N, gs)
+            else:
+                feat = decode_gaussian(mean_feat.reshape(-1), scale_feat.reshape(-1),
+                                        Q_feat.reshape(-1), os.path.join(path, 'feat.b')).view(N, self.feat_dim)
             scaling_act = decode_gaussian(mean_scaling.reshape(-1), scale_scaling.reshape(-1),
-                                          Q_scaling.reshape(-1), os.path.join(path, 'scaling.b')).view(N, 8)
-            offsets = decode_gaussian(mean_offsets.reshape(-1), scale_offsets.reshape(-1),
-                                       Q_offsets.reshape(-1), os.path.join(path, 'offsets.b')).view(N, self.n_offsets, 4)
+                                          Q_scaling.reshape(-1), os.path.join(path, 'scaling.b')).view(N, 7)
+            if uncoded.get('offsets_filtered', False):
+                # Mirrors conduct_encoding's filtering exactly: which offset slots are
+                # active is recomputed from the already-decoded `feat` via the same
+                # mlp_opacity call, so decode needs no extra side info for this -- see
+                # conduct_encoding's comment on offset_active for why that's valid.
+                assert not self.add_opacity_dist, \
+                    "offsets filtering assumes neural_opacity depends only on feat, not view direction/distance"
+                offset_active = (self.get_opacity_mlp(feat) > 0.0)  # [N, n_offsets]
+                offset_active_flat = offset_active.unsqueeze(-1).expand(N, self.n_offsets, 4).reshape(N, -1)
+                offsets_active_vals = decode_gaussian(
+                    mean_offsets[offset_active_flat], scale_offsets[offset_active_flat],
+                    Q_offsets[offset_active_flat], os.path.join(path, 'offsets.b'))
+                offsets_flat = torch.zeros(N, 4 * self.n_offsets, device=anchor.device)
+                offsets_flat[offset_active_flat] = offsets_active_vals
+                offsets = offsets_flat.view(N, self.n_offsets, 4)
+            else:
+                # Fallback for bitstreams written before offsets filtering existed (full
+                # dense tensor, no mask needed to reconstruct it).
+                offsets = decode_gaussian(mean_offsets.reshape(-1), scale_offsets.reshape(-1),
+                                           Q_offsets.reshape(-1), os.path.join(path, 'offsets.b')).view(N, self.n_offsets, 4)
 
             self._anchor = nn.Parameter(anchor)
             self._anchor_feat = nn.Parameter(feat)
@@ -472,8 +921,25 @@ class GaussianModel:
             self._opacity = nn.Parameter(opacity)
             # Reconstruct the real (8-bit quantized) continuous mask value rather than
             # treating every surviving anchor as fully open -- see conduct_encoding's
-            # comment on mask_q for why that matters.
-            mask_soft = uncoded['mask_q'].cuda().float() / 255
+            # comment on mask_q for why that matters. mask_q is entropy-coded (2-component
+            # Gaussian mixture, global params stored in uncoded_attrs.pt) rather than
+            # stored raw; 'mask_q' is kept as a fallback to still decode bitstreams written
+            # before that change.
+            if 'mask_gmm_params' in uncoded:
+                gmm_params = uncoded['mask_gmm_params'].cuda()
+                mask_means, mask_scales, mask_weights = gmm_params[0], gmm_params[1], gmm_params[2]
+                mask_mean1 = mask_means[0].expand(N).contiguous()
+                mask_mean2 = mask_means[1].expand(N).contiguous()
+                mask_scale1 = mask_scales[0].expand(N).contiguous()
+                mask_scale2 = mask_scales[1].expand(N).contiguous()
+                mask_prob1 = mask_weights[0].expand(N).contiguous()
+                mask_prob2 = mask_weights[1].expand(N).contiguous()
+                mask_q_f = decode_gaussian_mixed(
+                    mask_mean1, mask_mean2, mask_scale1, mask_scale2, mask_prob1, mask_prob2,
+                    1.0, os.path.join(path, 'mask.b'))
+                mask_soft = mask_q_f.clamp(0, 255) / 255
+            else:
+                mask_soft = uncoded['mask_q'].cuda().float() / 255
             self._mask_anchor = nn.Parameter(inverse_sigmoid(mask_soft.clamp(1e-6, 1 - 1e-6)).view(N, 1))
 
     def eval(self):
@@ -487,6 +953,8 @@ class GaussianModel:
         if self.use_entropy_coding:
             self.mlp_grid.eval()
             self.encoding_xyz.eval()
+            if self.use_intra_anchor_context:
+                self.mlp_channel_ctx.eval()
 
     def train(self):
         self.mlp_opacity.train()
@@ -499,6 +967,8 @@ class GaussianModel:
         if self.use_entropy_coding:
             self.mlp_grid.train()
             self.encoding_xyz.train()
+            if self.use_intra_anchor_context:
+                self.mlp_channel_ctx.train()
 
     def capture(self):
         return (
@@ -530,9 +1000,15 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
-    def set_appearance(self, num_cameras):
+    def set_appearance(self, physical_camera_ids):
+        # Indexed by PHYSICAL camera identity (e.g. N3DV's "camNN" rig index, shared across
+        # every frame of that view), not by Camera.uid (an arbitrary per-(view,frame)
+        # enumerate index with no semantic meaning -- see gaussian_renderer/__init__.py's
+        # appearance lookup for why that distinction matters: N3DV holds out one whole
+        # physical camera for test, which then has NO trained embedding row at all).
         if self.appearance_dim > 0:
-            self.embedding_appearance = Embedding(num_cameras, self.appearance_dim).cuda()
+            self.appearance_id_map = {pid: i for i, pid in enumerate(sorted(set(physical_camera_ids)))}
+            self.embedding_appearance = Embedding(len(self.appearance_id_map), self.appearance_dim).cuda()
 
     @property
     def get_appearance(self):
@@ -561,6 +1037,10 @@ class GaussianModel:
     @property
     def get_flow_mlp(self):
         return self.mlp_flow
+
+    @property
+    def get_time_basis_mlp(self):
+        return self.mlp_time_basis
 
     @property
     def get_rotation(self):
@@ -629,7 +1109,10 @@ class GaussianModel:
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud).float().cuda(), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 8)
+        # 7, not 8: scaling's 8th channel was dead (never read by anything that affects
+        # the rendered image -- see conduct_encoding's comment), so it's been dropped
+        # entirely rather than kept around and excluded only at encode time.
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 7)
         
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -661,8 +1144,21 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        if self.use_entropy_coding:
+            # Running sum of get_mask_anchor's value each time an anchor is visible, alongside
+            # anchor_demon's visit count -- averaging the two (in adjust_anchor) gives the
+            # rate-distortion mask's value AGGREGATED OVER EVERY (view, time) sample seen in
+            # this check_interval, instead of the single most-recent training iteration's
+            # instantaneous value. In a dynamic 4D scene each iteration renders a different
+            # (camera, timestamp) pair, so an anchor only relevant at one moment can look
+            # spuriously prunable (or keepable) at any single instant; a 3D static scene's
+            # anchors don't have this failure mode since only the camera varies iteration to
+            # iteration, never "when". See adjust_anchor's rate_prune_mask.
+            self.mask_val_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.photo_error_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.flow_speed_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_time_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_time_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
@@ -716,10 +1212,27 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
             ]
 
+        if self.motion_model in ('basis', 'taylor_residual'):
+            # NOT mlp_flow's own LR: mlp_time_basis is a tiny dt-only network that gets a
+            # gradient contribution from EVERY rendered offset in EVERY iteration (it's
+            # multiplied elementwise against per-offset coefficients and summed), so its
+            # effective gradient is far larger/more concentrated than any per-anchor-feat
+            # MLP's. At the full mlp_flow LR this diverges to NaN around the first
+            # densification events (~iter 2000-2500) in practice; 100x smaller keeps the
+            # same bilinear structure but stable.
+            l.append({'params': self.mlp_time_basis.parameters(), 'lr': training_args.mlp_flow_lr_init * 0.01, "name": "mlp_time_basis"})
+
         if self.use_entropy_coding:
             l.append({'params': self.mlp_grid.parameters(), 'lr': training_args.mlp_grid_lr_init, "name": "mlp_grid"})
             l.append({'params': self.encoding_xyz.parameters(), 'lr': training_args.encoding_xyz_lr_init, "name": "encoding_xyz"})
             l.append({'params': [self._mask_anchor], 'lr': training_args.mask_lr, "name": "mask_anchor"})
+            if self.use_intra_anchor_context:
+                # Reuses mlp_grid's LR schedule rather than a dedicated one: it's a
+                # similarly-sized MLP predicting the same kind of (mean, scale, prob)
+                # entropy-model parameters, just from intra- instead of inter-anchor
+                # context, so no reason to expect it needs different LR dynamics.
+                l.append({'params': self.mlp_channel_ctx.parameters(), 'lr': training_args.mlp_grid_lr_init,
+                          "name": "mlp_channel_ctx"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -792,6 +1305,9 @@ class GaussianModel:
             if param_group["name"] == "mlp_flow":
                 lr = self.mlp_flow_scheduler_args(iteration)
                 param_group['lr'] = lr
+            if param_group["name"] == "mlp_time_basis":
+                lr = self.mlp_flow_scheduler_args(iteration) * 0.01
+                param_group['lr'] = lr
             if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
                 lr = self.mlp_featurebank_scheduler_args(iteration)
                 param_group['lr'] = lr
@@ -803,6 +1319,9 @@ class GaussianModel:
                 param_group['lr'] = lr
             if self.use_entropy_coding and param_group["name"] == "encoding_xyz":
                 lr = self.encoding_xyz_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if self.use_entropy_coding and self.use_intra_anchor_context and param_group["name"] == "mlp_channel_ctx":
+                lr = self.mlp_grid_scheduler_args(iteration)
                 param_group['lr'] = lr
             
             
@@ -970,7 +1489,7 @@ class GaussianModel:
 
 
     # statis grad information to guide liftting. 
-    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask, opacity_t, sigma, lambda_temporal_sigma, timestamp, opt, activate_DA):
+    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask, opacity_t, sigma, lambda_temporal_sigma, timestamp, opt, activate_DA, neural_xyz=None, pixel_error_map=None, viewpoint_camera=None, flow_speed=None):
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
@@ -985,6 +1504,11 @@ class GaussianModel:
         
         # update anchor visiting statis
         self.anchor_demon[anchor_visible_mask] += 1
+
+        if self.use_entropy_coding:
+            # accumulate this iteration's (view, time) sample's mask value -- averaged against
+            # anchor_demon's matching visit count in adjust_anchor's rate_prune_mask
+            self.mask_val_accum[anchor_visible_mask] += self.get_mask_anchor[anchor_visible_mask].detach()
 
         # update neural gaussian statis
         anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)
@@ -1016,9 +1540,37 @@ class GaussianModel:
         self.offset_denom[combined_mask] += 1 * weight
         self.offset_time_denom[combined_mask] += grad_norm
 
-        
+        if neural_xyz is not None and pixel_error_map is not None:
+            # Photometric-error densification signal: sample this step's rendered-vs-GT
+            # per-pixel L1 error at each visible neural gaussian's own screen location,
+            # and accumulate it the same way as grad_norm above (same combined_mask,
+            # same per-visit averaging via offset_denom). Used by anchor_growing as an
+            # ADDITIONAL (OR'd, never subtracted) growth trigger alongside the existing
+            # gradient-norm criterion -- see anchor_growing's photo_mask.
+            xyz_vis = neural_xyz[update_filter]
+            ones = torch.ones_like(xyz_vis[:, :1])
+            clip = torch.cat([xyz_vis, ones], dim=-1) @ viewpoint_camera.full_proj_transform
+            w = clip[:, 3:4].clamp(min=1e-6)
+            ndc = (clip[:, :2] / w).clamp(min=-1.5, max=1.5)
+            grid = ndc.view(1, -1, 1, 2)
+            sampled_error = torch.nn.functional.grid_sample(
+                pixel_error_map.unsqueeze(0), grid, mode='bilinear',
+                padding_mode='border', align_corners=False
+            ).view(-1, 1)
+            self.photo_error_accum[combined_mask] += sampled_error * weight
 
-        
+        if flow_speed is not None:
+            # Same masked-space layout as opacity_t/sigma above (both come from the same
+            # mask-selected `masked` split in generate_neural_gaussians), unlike
+            # photo_error's projection -- flow_speed is already per-offset, so it only
+            # needs the same temp_mask scatter opacity_t/sigma use, not grid_sample.
+            temp_flow_speed = torch.zeros_like(temp_mask, dtype=torch.float)
+            temp_flow_speed[temp_mask] = flow_speed.squeeze(-1)
+            self.flow_speed_accum[combined_mask] += temp_flow_speed[combined_mask].unsqueeze(-1) * weight
+
+
+
+
     def _prune_anchor_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -1070,14 +1622,32 @@ class GaussianModel:
             self._mask_anchor = optimizable_tensors["mask_anchor"]
 
     
-    def anchor_growing(self, opt, grads, threshold, offset_mask, timestamp):
-        ## 
+    def anchor_growing(self, opt, grads, threshold, offset_mask, timestamp, photo_error=None, flow_speed=None):
+        ##
         init_length = self.get_anchor.shape[0]*self.n_offsets
         for i in range(self.update_depth):
             # update threshold
             cur_threshold = threshold*((self.update_hierachy_factor//2)**i)
             # mask from grad threshold
             candidate_mask = (grads >= cur_threshold)
+            if i == 0 and photo_error is not None and getattr(opt, 'photo_densify_threshold', 0.0) > 0:
+                # Additional, purely additive growth trigger (see training_statis):
+                # applied only at the finest level (i==0), so it never interacts with
+                # the hierarchical grad-threshold schedule used for i>0 -- it can only
+                # ever ADD candidates the gradient signal missed, never remove any.
+                photo_mask = (photo_error >= opt.photo_densify_threshold)
+                candidate_mask = torch.logical_or(candidate_mask, photo_mask)
+            if i == 0 and flow_speed is not None and getattr(opt, 'flow_densify_threshold', 0.0) > 0:
+                # Same purely-additive pattern as photo_mask above, driven by average
+                # per-visit motion speed instead of appearance error -- grows offsets in
+                # fast-moving regions even when their screen-space gradient (which
+                # responds to appearance error, not motion per se) doesn't cross
+                # densify_grad_threshold. Targets the under-resolved-detail-in-fast-
+                # motion-regions failure mode directly, at the density-growth level
+                # rather than indirectly via the temporal-opacity window (see
+                # motion_sigma_reg_weight).
+                flow_mask = (flow_speed >= opt.flow_densify_threshold)
+                candidate_mask = torch.logical_or(candidate_mask, flow_mask)
             candidate_mask = torch.logical_and(candidate_mask, offset_mask)
 
             # print(f"grad th {i}: {candidate_mask.sum().item()} / {candidate_mask.shape[0]}")
@@ -1156,9 +1726,13 @@ class GaussianModel:
 
             if candidate_anchor.shape[0] > 0:
                 # new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*cur_size # *0.05
+                # 7 cols total, not 8: the second block used to be .repeat([1,2]) (2
+                # copies of t_size, landing in the now-removed dead channel 7 -- see
+                # conduct_encoding's comment on it), so this just drops that duplicate,
+                # leaving every surviving column's value identical to before.
                 new_scaling = torch.cat([
                     torch.ones_like(candidate_anchor[:,:3]).repeat([1,2]).float().cuda()*cur_size,
-                    torch.ones_like(candidate_anchor[:,3:4]).repeat([1,2]).float().cuda()*t_size
+                    torch.ones_like(candidate_anchor[:,3:4]).float().cuda()*t_size
                 ], dim=1)
                 new_scaling = torch.log(new_scaling)
                 new_rotation = torch.zeros([candidate_anchor.shape[0], 4], device=candidate_anchor.device).float()
@@ -1192,6 +1766,11 @@ class GaussianModel:
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
 
+                if self.use_entropy_coding:
+                    temp_mask_val_accum = torch.cat([self.mask_val_accum, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+                    del self.mask_val_accum
+                    self.mask_val_accum = temp_mask_val_accum
+
                 torch.cuda.empty_cache()
                 
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -1215,14 +1794,29 @@ class GaussianModel:
 
         # print(f"denom th: {offset_mask.sum()} / {offset_mask.shape[0]}")
 
+        # Photometric-error densification signal (see training_statis): average per-visit
+        # rendered-vs-GT error at this offset's own screen location, same denom/visit-count
+        # gate as the gradient signal above. Purely additive in anchor_growing (OR'd with
+        # the existing grad_threshold test, never replacing or weakening it), so this can
+        # only ever add growth candidates the gradient signal missed, not remove any.
+        photo_error = self.photo_error_accum / self.offset_denom
+        photo_error[photo_error.isnan()] = 0.0
+        photo_error_norm = photo_error.squeeze(-1)
+
+        # Flow-magnitude densification signal (see training_statis): same additive,
+        # OR'd-in pattern as photo_error above -- see anchor_growing's flow_mask.
+        flow_speed_avg = self.flow_speed_accum / self.offset_denom
+        flow_speed_avg[flow_speed_avg.isnan()] = 0.0
+        flow_speed_norm = flow_speed_avg.squeeze(-1)
+
         timestamp = (self.offset_time_accum / self.offset_time_denom).squeeze()
-        
-        self.anchor_growing(opt, grads_norm, grad_threshold, offset_mask, timestamp)
-        
+
+        self.anchor_growing(opt, grads_norm, grad_threshold, offset_mask, timestamp, photo_error_norm, flow_speed_norm)
+
         # update offset_denom
         self.offset_denom[offset_mask] = 0
         padding_offset_demon = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_denom.shape[0], 1],
-                                           dtype=torch.int32, 
+                                           dtype=torch.int32,
                                            device=self.offset_denom.device)
         self.offset_denom = torch.cat([self.offset_denom, padding_offset_demon], dim=0)
 
@@ -1234,21 +1828,42 @@ class GaussianModel:
 
         self.offset_gradient_accum[offset_mask] = 0
         padding_offset_gradient_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_gradient_accum.shape[0], 1],
-                                           dtype=torch.int32, 
+                                           dtype=torch.int32,
                                            device=self.offset_gradient_accum.device)
         padding_offset_time_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_time_accum.shape[0], 1],
-                                             dtype=torch.int32, 
+                                             dtype=torch.int32,
                                              device=self.offset_time_accum.device)
         self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
         self.offset_time_accum = torch.cat([self.offset_time_accum, padding_offset_time_accum], dim=0)
-        
+
+        self.photo_error_accum[offset_mask] = 0
+        padding_photo_error_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.photo_error_accum.shape[0], 1],
+                                           dtype=torch.int32,
+                                           device=self.photo_error_accum.device)
+        self.photo_error_accum = torch.cat([self.photo_error_accum, padding_photo_error_accum], dim=0)
+
+        self.flow_speed_accum[offset_mask] = 0
+        padding_flow_speed_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.flow_speed_accum.shape[0], 1],
+                                           dtype=torch.int32,
+                                           device=self.flow_speed_accum.device)
+        self.flow_speed_accum = torch.cat([self.flow_speed_accum, padding_flow_speed_accum], dim=0)
+
         # # prune anchors
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
         prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N]
         if self.use_entropy_coding:
-            # rate-distortion mask: anchors the model has learned are not worth their coding cost
-            rate_prune_mask = (self.get_mask_anchor.squeeze(dim=1) < opt.mask_prune_threshold)
+            # rate-distortion mask: anchors the model has learned are not worth their coding cost.
+            # Averaged over every (view, time) sample seen since the last check (mask_val_accum /
+            # anchor_demon), not the single most-recent iteration's instantaneous value -- a 4D
+            # anchor's relevance can vary a lot across the time range, and each iteration only
+            # renders one timestamp, so the instantaneous value is a noisy single sample of that.
+            # Anchors with zero visits this interval (anchor_demon==0, e.g. just grown) are
+            # excluded rather than defaulting to "prunable": mask_val_accum/anchor_demon would
+            # otherwise read as 0 (below any positive threshold) for every one of them.
+            visited = self.anchor_demon.squeeze(dim=1) > 0
+            mask_avg = (self.mask_val_accum / self.anchor_demon.clamp(min=1)).squeeze(dim=1)
+            rate_prune_mask = visited & (mask_avg < opt.mask_prune_threshold)
             prune_mask = torch.logical_or(prune_mask, rate_prune_mask)
         
         # update offset_denom
@@ -1267,19 +1882,36 @@ class GaussianModel:
         del self.offset_gradient_accum
         self.offset_gradient_accum = offset_gradient_accum
 
+        photo_error_accum = self.photo_error_accum.view([-1, self.n_offsets])[~prune_mask]
+        photo_error_accum = photo_error_accum.view([-1, 1])
+        del self.photo_error_accum
+        self.photo_error_accum = photo_error_accum
+
+        flow_speed_accum = self.flow_speed_accum.view([-1, self.n_offsets])[~prune_mask]
+        flow_speed_accum = flow_speed_accum.view([-1, 1])
+        del self.flow_speed_accum
+        self.flow_speed_accum = flow_speed_accum
+
         offset_time_accum = self.offset_time_accum.view([-1, self.n_offsets])[~prune_mask]
         offset_time_accum = offset_time_accum.view([-1, 1])
         del self.offset_time_accum
         self.offset_time_accum = offset_time_accum
         
-        # update opacity accum 
+        # update opacity accum
         if anchors_mask.sum()>0:
             self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+            if self.use_entropy_coding:
+                self.mask_val_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
             self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
-        
+
         temp_opacity_accum = self.opacity_accum[~prune_mask]
         del self.opacity_accum
         self.opacity_accum = temp_opacity_accum
+
+        if self.use_entropy_coding:
+            temp_mask_val_accum = self.mask_val_accum[~prune_mask]
+            del self.mask_val_accum
+            self.mask_val_accum = temp_mask_val_accum
 
         temp_anchor_demon = self.anchor_demon[~prune_mask]
         del self.anchor_demon
@@ -1313,6 +1945,14 @@ class GaussianModel:
             flow_mlp.save(os.path.join(path, 'flow_mlp.pt'))
             self.mlp_flow.train()
 
+            if self.motion_model in ('basis', 'taylor_residual'):
+                # Plain state_dict (not jit.trace) -- matches mlp_channel_ctx's pattern just
+                # below; a 1-input MLP traces fine either way, but state_dict avoids any
+                # risk of tracing baking in example-input-specific behavior.
+                self.mlp_time_basis.eval()
+                torch.save(self.mlp_time_basis.state_dict(), os.path.join(path, 'time_basis_mlp.pt'))
+                self.mlp_time_basis.train()
+
             if self.use_feat_bank:
                 self.mlp_feature_bank.eval()
                 feature_bank_mlp = torch.jit.trace(self.mlp_feature_bank, (torch.rand(1, 3+1).cuda()))
@@ -1327,7 +1967,7 @@ class GaussianModel:
 
             if self.use_entropy_coding:
                 self.mlp_grid.eval()
-                hash_feat_dim = self.encoding_xyz[0].output_dim * len(HASH_TRIPLETS)
+                hash_feat_dim = sum(encoder.output_dim for encoder in self.encoding_xyz)
                 grid_mlp = torch.jit.trace(self.mlp_grid, (torch.rand(1, hash_feat_dim).cuda()))
                 grid_mlp.save(os.path.join(path, 'grid_mlp.pt'))
                 self.mlp_grid.train()
@@ -1335,6 +1975,18 @@ class GaussianModel:
                 self.save_hash_grid(os.path.join(path, 'encoding_xyz.bin'))
                 torch.save({'x_bound_min': self.x_bound_min, 'x_bound_max': self.x_bound_max},
                            os.path.join(path, 'anchor_bound.pt'))
+
+                if self.use_intra_anchor_context:
+                    # Not torch.jit.trace'd like the other MLPs above: ChannelCtxFeat's
+                    # forward() branches on to_dec (which group to return, and how many
+                    # of the preceding groups to actually run), and tracing only captures
+                    # the ONE branch taken with whatever example input is given -- it
+                    # would silently bake in a single to_dec value and break every other
+                    # group's encode/decode call. Plain state_dict preserves the real
+                    # Python control flow.
+                    self.mlp_channel_ctx.eval()
+                    torch.save(self.mlp_channel_ctx.state_dict(), os.path.join(path, 'channel_ctx_mlp.pt'))
+                    self.mlp_channel_ctx.train()
 
         elif mode == 'unite':
             if self.use_feat_bank:
@@ -1371,6 +2023,8 @@ class GaussianModel:
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
             self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
             self.mlp_flow = torch.jit.load(os.path.join(path, 'flow_mlp.pt')).cuda()
+            if self.motion_model in ('basis', 'taylor_residual'):
+                self.mlp_time_basis.load_state_dict(torch.load(os.path.join(path, 'time_basis_mlp.pt')))
             if self.use_feat_bank:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:
@@ -1382,6 +2036,8 @@ class GaussianModel:
                 self.x_bound_min = bounds['x_bound_min']
                 self.x_bound_max = bounds['x_bound_max']
                 self.bounds_ready = True
+                if self.use_intra_anchor_context:
+                    self.mlp_channel_ctx.load_state_dict(torch.load(os.path.join(path, 'channel_ctx_mlp.pt')))
         elif mode == 'unite':
             checkpoint = torch.load(os.path.join(path, 'checkpoints.pth'))
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
@@ -1394,3 +2050,55 @@ class GaussianModel:
                 self.embedding_appearance.load_state_dict(checkpoint['appearance'])
         else:
             raise NotImplementedError
+
+    @staticmethod
+    def _quantize_int8(tensor):
+        """Per-tensor symmetric int8 quantization. Returns (int8_tensor_cpu, scale)."""
+        scale = (tensor.abs().max().clamp(min=1e-12) / 127.0).item()
+        q = torch.clamp(torch.round(tensor / scale), -128, 127).to(torch.int8)
+        return q.cpu(), scale
+
+    def save_mlp_checkpoints_int8(self, path):
+        """Export-only, lossy-but-cheap alternative to save_mlp_checkpoints(mode='split'):
+        quantizes every parameter of the 6 small MLPs (opacity/cov/color/flow/grid/
+        channel_ctx) to int8 + a per-tensor float scale, bypassing torch.jit entirely
+        (jit has no native int8 linear-layer path, and its fixed per-module container
+        overhead would eat most of the theoretical saving anyway -- confirmed in
+        practice: fp16 via jit only achieved ~34% size reduction, not the ~50% the
+        bit-width alone implies). Does NOT replace save_mlp_checkpoints -- call this
+        separately at final export time once a checkpoint is otherwise finished;
+        training/encoding keeps using the normal fp32 jit-traced path throughout.
+        Confirmed on a real checkpoint: -0.26dB PSNR cost, ~72% smaller mlps component
+        (see load_mlp_checkpoints_int8's docstring for the matching load path)."""
+        mkdir_p(path)
+        modules = {
+            'opacity_mlp': self.mlp_opacity, 'cov_mlp': self.mlp_cov,
+            'color_mlp': self.mlp_color, 'flow_mlp': self.mlp_flow,
+        }
+        if self.use_entropy_coding:
+            modules['grid_mlp'] = self.mlp_grid
+            if self.use_intra_anchor_context:
+                modules['channel_ctx_mlp'] = self.mlp_channel_ctx
+        out = {}
+        for name, m in modules.items():
+            out[name] = {pname: self._quantize_int8(p.data) for pname, p in m.named_parameters()}
+        torch.save(out, os.path.join(path, 'mlps_int8.pt'))
+
+    def load_mlp_checkpoints_int8(self, path):
+        """Inverse of save_mlp_checkpoints_int8: dequantizes back to fp32 and
+        load_state_dict's into the already-constructed self.mlp_* modules (built fresh
+        in __init__, same ones load_mlp_checkpoints(mode='split') would otherwise
+        jit.load over) -- no need to reconstruct the Sequential architectures here."""
+        state = torch.load(os.path.join(path, 'mlps_int8.pt'))
+        modules = {
+            'opacity_mlp': self.mlp_opacity, 'cov_mlp': self.mlp_cov,
+            'color_mlp': self.mlp_color, 'flow_mlp': self.mlp_flow,
+        }
+        if self.use_entropy_coding:
+            modules['grid_mlp'] = self.mlp_grid
+            if self.use_intra_anchor_context:
+                modules['channel_ctx_mlp'] = self.mlp_channel_ctx
+        for name, m in modules.items():
+            sd = {pname: (q.float() * scale).cuda() for pname, (q, scale) in state[name].items()}
+            m.load_state_dict(sd)
+            m.cuda()

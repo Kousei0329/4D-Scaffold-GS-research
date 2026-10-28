@@ -23,7 +23,7 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
 from scene import Scene
 import json
 import time
-from gaussian_renderer import render, prefilter_voxel
+from gaussian_renderer import render, render_cached, prefilter_voxel
 import torchvision
 from tqdm import tqdm
 from utils.general_utils import safe_state
@@ -54,7 +54,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
             torch.cuda.synchronize(); t0 = time.time()
             voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipeline, background)
-            render_pkg = render(viewpoint_cam, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
+            # render_cached reuses the anchor-level neural-Gaussian outputs across
+            # consecutive frames that share a camera (the N3DV/Neu3D test-set protocol:
+            # one held-out camera x many timestamps) instead of recomputing the 4 MLPs
+            # every frame; it rebuilds automatically if the camera changes.
+            render_pkg = render_cached(viewpoint_cam, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
             torch.cuda.synchronize(); t1 = time.time()
 
             rendering = render_pkg["render"]
@@ -80,9 +84,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
             torch.cuda.synchronize(); t0 = time.time()
             voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipeline, background)
-            render_pkg = render(viewpoint_cam, gaussians, pipeline, background, visible_mask=voxel_visible_mask, use_cache=True)
+            render_pkg = render_cached(viewpoint_cam, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
             torch.cuda.synchronize(); t1 = time.time()
-            
+
             t_list.append(t1-t0)
 
         t = np.array(t_list[5:])
@@ -94,9 +98,17 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.t_grid_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.temporal_opacity, dataset.use_flow, dataset.sigma_denom_weight,
                               use_entropy_coding=dataset.use_entropy_coding, hash_n_features=dataset.hash_n_features, hash_log2_size=dataset.hash_log2_size,
-                              noise_start_iter=dataset.noise_start_iter, entropy_start_iter=dataset.entropy_start_iter)
+                              noise_start_iter=dataset.noise_start_iter, entropy_start_iter=dataset.entropy_start_iter,
+                              use_intra_anchor_context=dataset.use_intra_anchor_context,
+                              use_joint_4d_hash=dataset.use_joint_4d_hash,
+                              use_hybrid_4d_hash=dataset.use_hybrid_4d_hash,
+                              use_full_hybrid_4d_hash=dataset.use_full_hybrid_4d_hash,
+                              motion_model=dataset.motion_model,
+                              motion_basis_dim=dataset.motion_basis_dim)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-        
+        if not dataset.disable_mip_filter:
+            gaussians.compute_3D_filter(cameras=scene.train_cameras[1.0])
+
         gaussians.eval()
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]

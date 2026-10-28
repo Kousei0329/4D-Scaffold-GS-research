@@ -91,6 +91,26 @@ class ModelParams(ParamGroup):
         # Ablation options
         self.temporal_opacity = '4dgs' # ['4dgs', 'ours']
         self.use_flow = False
+        # Ablation flag for validating the Mip-Splatting 3D smoothing filter (see
+        # compute_3D_filter in gaussian_model.py): True reproduces pre-filter behavior
+        # exactly (filter_3D is never computed, so generate_neural_gaussians' fallback
+        # adds zero variance), for apples-to-apples baseline comparisons. Default False
+        # (filter ON) is the actual intended behavior going forward.
+        self.disable_mip_filter = False
+        # Ablation: how per-offset xyz(t) motion beyond the base anchor is modeled.
+        # 'linear'          -- current default: xyz(t) = base + velocity(feat)*dt
+        # 'basis'           -- DynMF/TED-4DGS-style: xyz(t) = base + sum_b coeff_b(feat)*Phi_b(dt),
+        #                      Phi a shared *learned* small MLP over dt (motion_basis_dim bases);
+        #                      replaces the velocity term entirely but stays bitstream-neutral
+        #                      (Phi is a fixed shared network, coeff comes from already-coded feat).
+        # 'taylor_residual' -- Taylor-Gaussian-style hybrid: explicit 3rd-order Taylor
+        #                      (velocity+acceleration+jerk) PLUS a small learned-basis residual
+        #                      correction (half motion_basis_dim bases) added on top.
+        # 'fourier'         -- RD4DGS/DynMF-Fourier-ablation-style: same combination as 'basis'
+        #                      but Phi is a FIXED sin/cos harmonic basis (not learned) -- a
+        #                      low-frequency-only control expected to underperform 'basis'.
+        self.motion_model = 'linear'
+        self.motion_basis_dim = 16
         self.sigma_denom_weight = False
         self.disable_denom_weight = False
         self.filter_opacity = False
@@ -101,7 +121,23 @@ class ModelParams(ParamGroup):
         self.hash_log2_size = 19
         self.noise_start_iter = 3_000
         self.entropy_start_iter = 10_000
-        
+        # HAC++-style intra-anchor channel context: splits anchor_feat into groups coded
+        # sequentially (each conditioned on the same anchor's earlier groups), mixed with
+        # the hash-grid's inter-anchor prediction via a 2-component Gaussian mixture. Only
+        # takes effect when use_entropy_coding is also set.
+        self.use_intra_anchor_context = False
+        # Ablation: single true 4D (x,y,z,t) joint hash grid instead of the 4 factored 3D
+        # triplet grids (HASH_TRIPLETS). Only takes effect when use_entropy_coding is set.
+        self.use_joint_4d_hash = False
+        # Ablation: joint 4D hash grid (shortened resolution schedule) PLUS a dedicated
+        # xyz-only 3D hash grid. Mutually exclusive with use_joint_4d_hash. Only takes
+        # effect when use_entropy_coding is set.
+        self.use_hybrid_4d_hash = False
+        # Ablation: joint 4D hash grid (shortened schedule) PLUS all 4 original 3D triplet
+        # grids (5 tables total). Mutually exclusive with use_joint_4d_hash/use_hybrid_4d_hash.
+        # Only takes effect when use_entropy_coding is set.
+        self.use_full_hybrid_4d_hash = False
+
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -180,11 +216,52 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
+        # Additional densification trigger (see anchor_growing's photo_mask): grow an
+        # offset whose average per-visit rendered-vs-GT L1 error (sampled at its own
+        # screen location) exceeds this, even if its gradient norm doesn't cross
+        # densify_grad_threshold. Purely additive -- never removes a gradient-based
+        # growth candidate. 0 disables it entirely (falls back to the original
+        # gradient-only behavior). Default picked conservatively above typical average
+        # L1 (~0.025-0.03 on N3DV scenes) so it only fires on persistently bad regions.
+        self.photo_densify_threshold = 0.1
+        # Additional densification trigger (see anchor_growing's flow_mask): grow an
+        # offset whose average per-visit motion speed (flow[:, :3].norm(), range [0,
+        # sqrt(3)] for 'linear'/'taylor_residual' motion models since flow's first 3
+        # channels are Tanh-bounded velocity) exceeds this, even if its gradient norm
+        # doesn't cross densify_grad_threshold. Same purely-additive pattern as
+        # photo_densify_threshold. 0.0 (default) disables it entirely -- backward
+        # compatible. Needs train.py to actually pass flow_speed into training_statis
+        # (gated the same way as motion_sigma_reg_weight: only when use_flow and
+        # motion_model in ('linear', 'taylor_residual')).
+        self.flow_densify_threshold = 0.0
+        # Debug/stability flag: force global grad-norm clipping on even for
+        # motion_model='linear' (normally gated off there -- see the optimizer-step
+        # comment in train.py). Use when a specific (scene, lambda) combination shows
+        # gradient-blowup-style NaNs/CUDA illegal-memory-access that a non-'linear'
+        # motion model would already have been protected against. Default False.
+        self.force_grad_clip = False
 
         self.lambda_temporal_sigma = 1.0 # Gamma in the paper
 
+        # Encourages a narrower temporal opacity window (larger sigma) specifically where
+        # the learned motion velocity is large, via loss += weight * (flow_speed.detach()
+        # * exp(-sigma)).mean() (see train.py). sigma is already per-offset/anchor-adaptive
+        # (learned from get_cov_mlp's output, not a global constant), but nothing currently
+        # gives it an explicit incentive to track motion speed -- it only gets photometric
+        # gradient, which fast-moving regions (fewer sharp frames to anchor against) may
+        # supply too weakly. 0.0 (default) disables this entirely -- backward compatible,
+        # zero behavior change for any existing run. Only meaningful for motion_model in
+        # ('linear', 'taylor_residual'), where flow's first 3 channels are a literal
+        # velocity; silently skipped (no-op) for 'basis'/'fourier' where they aren't.
+        self.motion_sigma_reg_weight = 0.0
+
         # entropy coding (HAC-style hash-grid context model)
         self.lmbda = 0.001
+        # Iterations over which lmbda ramps linearly from 0 to its target value after
+        # entropy_start_iter, instead of switching on at full strength immediately. 0 (default)
+        # keeps the old abrupt on/off behavior. See train.py's rate-loss comment for why this
+        # exists.
+        self.lmbda_ramp_iters = 0
         self.encoding_xyz_lr_init = 0.005
         self.encoding_xyz_lr_final = 0.00001
         self.encoding_xyz_lr_delay_mult = 0.33
@@ -197,6 +274,16 @@ class OptimizationParams(ParamGroup):
 
         self.mask_lr = 0.01
         self.mask_prune_threshold = 0.01
+
+        # Online best-checkpoint tracking: every best_ckpt_check_interval iterations (once
+        # past entropy_start_iter), evaluate the test-set RD loss and, if it improves on the
+        # best seen so far, save+encode the current weights over a single "best" checkpoint
+        # slot (not one per check -- that would blow up disk and encode-time cost). This is
+        # a strictly finer-grained version of the --save_iterations-based end-of-training
+        # checkpoint selection (see train.py): instead of only comparing a handful of fixed
+        # checkpoints, it continuously tracks the true minimum. 0 disables it (falls back to
+        # --save_iterations-only selection).
+        self.best_ckpt_check_interval = 2000
 
         # Some experimental options
         self.lambda_sigma_multiply = 1.0
