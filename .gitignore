@@ -4,8 +4,10 @@ temp*
 outputs*
 debug*
 log*
+*.log
 view*
 wandb*
+.wandb_mode
 *.bak
 data
 *build/*
