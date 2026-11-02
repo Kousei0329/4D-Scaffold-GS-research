@@ -121,6 +121,25 @@ data/
 ...
 ```
 
+D-NeRFデータセット([Pumarola et al., CVPR 2021](https://github.com/albertpumarola/D-NeRF))の場合、前処理不要でそのまま`transforms_train.json`形式になっており、データ構成は以下の通りです(単眼・合成シーン。マルチビューのN3DV/technicolorとは異なり、anchorの初期点群はランダム生成されます):
+
+```
+data/
+├── D-NeRF/
+│   ├── hellwarrior/
+│   │   ├── train/
+│   │   │   ├── r_000.png
+│   │   │   ├── ...
+│   │   ├── test/
+│   │   ├── val/
+│   │   ├── transforms_train.json
+│   │   ├── transforms_test.json
+│   │   ├── transforms_val.json
+...
+```
+
+ダウンロードは[公式リポジトリ](https://github.com/albertpumarola/D-NeRF)のData.zip(Dropboxミラー)から、シーンごとのフォルダを`data/D-NeRF/`以下に展開するだけで使えます。
+
 N3DVデータセットの前処理は[4DGS](https://github.com/fudan-zvg/4d-gaussian-splatting)の手順、technicolorデータセットの前処理は[E-D3DGS](https://github.com/JeongminB/E-D3DGS)の手順に従ってください。
 
 
@@ -249,3 +268,17 @@ python metrics.py -m <path to trained model> # レンダリング結果の誤差
   - `train.py`の`CUDA_VISIBLE_DEVICES`自動選択(起動時に最も空いているGPUを選ぶ処理)が、明示的に`--gpu`を指定した場合でも無条件に実行されていたバグを修正。2つのジョブをほぼ同時に起動すると、運悪く同じ物理GPUを選んでしまい競合することがありました
   - 学習終了時の`evaluate()`(LPIPS計算)の直前に`torch.cuda.empty_cache()`を追加。学習ループの未解放メモリが原因のOOMクラッシュに対処
 - `arithmetic_coding.py`/`entropy_models.py`/`octree_coding.py`: 2成分ガウス混合事前分布の実際の算術符号化(`encode_gaussian_mixed`等)と、オクツリーマスクのコンテキスト条件付きビット推定を追加
+
+**2026-11-02**
+
+CVPR投稿論文向けのablation study用フラグ、Ex4DGS風のper-anchor motion gate、およびD-NeRFデータセット対応の既存バグ修正を行いました。デフォルトでは全て無効/既存動作のまま(RGBA合成のバグ修正のみ、Blender形式データセットを使った場合に挙動が変わります)。
+
+- ablation用フラグ(いずれも`--use_entropy_coding`が有効な場合のみ効果があり、デフォルト`False`): `sear_steak`でのスモークテスト(2000 iter)は全て完走を確認済み
+  - `--ablation_no_hash_context`: ハッシュグリッド文脈を使わず、`mlp_grid`への入力を定数(アンカー座標に依存しない)にする
+  - `--ablation_fixed_quant`: `adaptive_Q`による適応量子化をスキップし、固定の`Q_base`のみで量子化する
+  - `--ablation_no_time_agg_mask`: アンカーの剪定判定を、時間集約した平均(`mask_val_accum`/`anchor_demon`)ではなく直近1回の反復のマスク値(`mask_val_last`)のみで行う
+- `--motion_gate_weight`(デフォルト`0.0`): Ex4DGS風の、アンカーごとに学習するmotion gate(sigmoid)をflow出力に掛け、静的なアンカーが自身の動き計算をゼロに抑制できるようにする。`--use_offset_mask`と同様、anchor growing終了時(`update_until`)に一度だけ確保
+- `--motion_smooth_weight`/`--motion_smooth_sample`(デフォルト`0.0`/`4096`): E-D3DGS風の局所motion-smoothness正則化。ランダムサブサンプル内での最近傍ペア間でflowの二乗差を取る
+- `--use_offset_mask`(デフォルト`False`): アンカー単位ではなくoffsetスロット単位でのレート歪みマスクを追加する
+- `scene/__init__.py`/`utils/data_utils.py`: `--white_background`が実質効いていなかったバグを修正。Blender/D-NeRF形式(`transforms_train.json`が存在する)データセットでは`Scene`が自動的に`rgba=True`を使うようにし、`CameraDataset.__getitem__`内のアルファマスク適用判定が間違った軸(`shape[1]`、実際はheight)を見ていたのを`shape[0]`(チャンネル数)に修正。既存のN3DVなどRGBのみのデータセットには影響なし
+- D-NeRFデータセット(`transforms_train.json`を使うBlender形式)は既存の`scene/dataset_readers.py`のローダーがそのまま動作することを確認(`hellwarrior`シーンで3000 iterのスモークテストが完走)。データ構成は下記「データ」セクションのD-NeRFの項を参照
