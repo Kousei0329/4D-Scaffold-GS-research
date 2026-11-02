@@ -103,6 +103,9 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                               use_joint_4d_hash=dataset.use_joint_4d_hash,
                               use_hybrid_4d_hash=dataset.use_hybrid_4d_hash,
                               use_full_hybrid_4d_hash=dataset.use_full_hybrid_4d_hash,
+                              ablation_no_hash_context=dataset.ablation_no_hash_context,
+                              ablation_fixed_quant=dataset.ablation_fixed_quant,
+                              ablation_no_time_agg_mask=dataset.ablation_no_time_agg_mask,
                               motion_model=dataset.motion_model,
                               motion_basis_dim=dataset.motion_basis_dim)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)

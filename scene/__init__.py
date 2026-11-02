@@ -31,6 +31,10 @@ class Scene:
         self.loaded_iter = None
         self.gaussians = gaussians
         self.white_background = args.white_background
+        # Blender/D-NeRF-style datasets ship RGBA renders; alpha-composite them against
+        # white_background (otherwise transparent regions keep whatever raw RGB the
+        # renderer wrote there, instead of actually respecting the flag).
+        self.rgba = os.path.exists(os.path.join(args.source_path, "transforms_train.json"))
 
         if load_iteration:
             if load_iteration == -1:
@@ -106,8 +110,10 @@ class Scene:
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         self.gaussians.save_mlp_checkpoints(point_cloud_path)
 
-    def getTrainCameras(self, scale=1.0, view_only=False, rgba=False):
+    def getTrainCameras(self, scale=1.0, view_only=False, rgba=None):
+        rgba = self.rgba if rgba is None else rgba
         return CameraDataset(self.train_cameras[scale].copy(), self.white_background, view_only, rgba)
-        
-    def getTestCameras(self, scale=1.0, view_only=False, rgba=False):
+
+    def getTestCameras(self, scale=1.0, view_only=False, rgba=None):
+        rgba = self.rgba if rgba is None else rgba
         return CameraDataset(self.test_cameras[scale].copy(), self.white_background, view_only, rgba)

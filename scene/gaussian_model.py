@@ -181,11 +181,14 @@ class GaussianModel:
                  use_joint_4d_hash : bool = False,
                  use_hybrid_4d_hash : bool = False,
                  use_full_hybrid_4d_hash : bool = False,
+                 ablation_no_hash_context : bool = False,
+                 ablation_fixed_quant : bool = False,
+                 ablation_no_time_agg_mask : bool = False,
                  motion_model : str = 'linear',
                  motion_basis_dim : int = 16,
                  ):
-        assert sum([use_joint_4d_hash, use_hybrid_4d_hash, use_full_hybrid_4d_hash]) <= 1, \
-            "use_joint_4d_hash, use_hybrid_4d_hash and use_full_hybrid_4d_hash are mutually exclusive hash-grid ablations"
+        assert sum([use_joint_4d_hash, use_hybrid_4d_hash, use_full_hybrid_4d_hash, ablation_no_hash_context]) <= 1, \
+            "use_joint_4d_hash, use_hybrid_4d_hash, use_full_hybrid_4d_hash and ablation_no_hash_context are mutually exclusive hash-grid configurations"
 
         self.feat_dim = feat_dim
         self.n_offsets = n_offsets
@@ -217,6 +220,9 @@ class GaussianModel:
         self.use_joint_4d_hash = use_joint_4d_hash
         self.use_hybrid_4d_hash = use_hybrid_4d_hash
         self.use_full_hybrid_4d_hash = use_full_hybrid_4d_hash
+        self.ablation_no_hash_context = ablation_no_hash_context
+        self.ablation_fixed_quant = ablation_fixed_quant
+        self.ablation_no_time_agg_mask = ablation_no_time_agg_mask
         self.motion_model = motion_model
         self.motion_basis_dim = motion_basis_dim
 
@@ -232,11 +238,32 @@ class GaussianModel:
         
         self.opacity_accum = torch.empty(0)
         self.mask_val_accum = torch.empty(0)
+        # Ablation companion to mask_val_accum: overwritten (not accumulated) on every
+        # visit, so it always holds only the CURRENT iteration's instantaneous mask
+        # value rather than a running average -- see ablation_no_time_agg_mask's use at
+        # the prune decision.
+        self.mask_val_last = torch.empty(0)
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
+
+        # Offset-level (sub-anchor) rate-distortion mask, gating opacity and bit_offsets
+        # per individual offset slot rather than per whole anchor like _mask_anchor.
+        # Only allocated once anchor growing has finished (iteration == update_until in
+        # train.py), since its shape [N, n_offsets] must track the final, frozen anchor
+        # count -- unlike _mask_anchor it does NOT participate in the grow/prune lifecycle.
+        self._mask_offset = torch.empty(0)
+        self.use_offset_mask = False
+
+        # Ex4DGS-inspired per-anchor motion gate: multiplies the anchor's raw flow output
+        # before motion displacement is computed, letting a static anchor learn to fully
+        # suppress its own motion. Allocated at update_until like _mask_offset (shape [N,
+        # 1] must track the final, frozen anchor count), so it does NOT participate in
+        # the grow/prune lifecycle.
+        self._motion_gate = torch.empty(0)
+        self.use_motion_gate = False
         
         self.offset_gradient_accum = torch.empty(0)
         # Parallel accumulator for the photometric-error densification signal (see
@@ -359,7 +386,21 @@ class GaussianModel:
             self.x_bound_max = torch.ones((1, 4), device="cuda")
             self.bounds_ready = False
 
-            if self.use_full_hybrid_4d_hash:
+            if self.ablation_no_hash_context:
+                # Ablation: same single 4D joint table as use_joint_4d_hash, but
+                # calc_interp_feat below queries it at a FIXED constant coordinate for
+                # every anchor instead of the anchor's real (x,y,z,t) -- so the looked-up
+                # feature (and everything mlp_grid predicts from it) no longer depends on
+                # anchor position, i.e. no inter-anchor spatiotemporal context, while
+                # still being a learned (not hardcoded-zero) value. Reusing the real
+                # GridEncoder this way (rather than a bare nn.Parameter) means every
+                # existing save/load/rate-loss code path for encoding_xyz works
+                # unchanged; only calc_interp_feat's query point differs.
+                self.encoding_xyz = nn.ModuleList([
+                    GridEncoder(num_dim=4, n_features=hash_n_features, log2_hashmap_size=hash_log2_size,
+                                ste_binary=True, ste_multistep=False, add_noise=False, Q=1)
+                ]).cuda()
+            elif self.use_full_hybrid_4d_hash:
                 # 4D joint table (shortened schedule) + all 4 original 3D triplet tables --
                 # the "everything" ablation point: does stacking the factored triplets ON TOP
                 # of the joint table help, or is the joint table's own spatiotemporal coupling
@@ -425,7 +466,12 @@ class GaussianModel:
         # x: [N, 4] anchor positions (x, y, z, t)
         assert len(x.shape) == 2 and x.shape[1] == 4
         x = (x - self.x_bound_min) / (self.x_bound_max - self.x_bound_min)  # -> [0, 1]
-        if self.use_full_hybrid_4d_hash:
+        if self.ablation_no_hash_context:
+            # Query the single table at the same fixed point (grid center) for every
+            # anchor, regardless of x -- see this flag's comment in __init__.
+            x_const = torch.full_like(x, 0.5)
+            feats = [self.encoding_xyz[0](x_const)]
+        elif self.use_full_hybrid_4d_hash:
             feats = [self.encoding_xyz[0](x)] + \
                 [encoder(x[:, triplet]) for encoder, triplet in zip(self.encoding_xyz[1:], HASH_TRIPLETS)]
         elif self.use_hybrid_4d_hash:
@@ -448,8 +494,14 @@ class GaussianModel:
             sizes.append(self.feat_dim)
         return torch.split(y, sizes, dim=-1)
 
-    @staticmethod
-    def adaptive_Q(Q_base, Q_adj):
+    def adaptive_Q(self, Q_base, Q_adj):
+        # Ablation: skip the adaptive step entirely and always quantize at the fixed
+        # base width. Q_adj is still predicted by mlp_grid upstream (unused dead weight
+        # under this flag) rather than conditionally removed from grid_out_dim -- keeping
+        # the network architecture identical to the non-ablated run isolates this
+        # ablation to exactly the quantization step, not a confounded smaller model.
+        if self.ablation_fixed_quant:
+            return torch.as_tensor(Q_base, dtype=Q_adj.dtype, device=Q_adj.device).expand_as(Q_adj)
         # HAC-style adaptive quantization step: Q in [0.1*Q_base, 2*Q_base].
         # The floor matters more than it looks: encode_gaussian's arithmetic coder builds
         # a CDF table sized by round(x/Q)'s range, shared across every element in one
@@ -518,6 +570,20 @@ class GaussianModel:
         # Per-anchor rate-distortion mask: anchors whose learned probability of being
         # "kept" falls below mask_prune_threshold are candidates for physical pruning.
         return torch.sigmoid(self._mask_anchor)
+
+    @property
+    def get_mask_offset(self):
+        # Per-offset (sub-anchor) rate-distortion mask, shape [N, n_offsets]. Gates
+        # opacity and bit_offsets at finer granularity than get_mask_anchor, so an anchor
+        # that is worth keeping can still shed individual unused offset slots. Only valid
+        # once self._mask_offset has been allocated (see use_offset_mask in train.py).
+        return torch.sigmoid(self._mask_offset)
+
+    @property
+    def get_motion_gate(self):
+        # Per-anchor motion gate, shape [N, 1]. Only valid once self._motion_gate has
+        # been allocated (see use_motion_gate in train.py).
+        return torch.sigmoid(self._motion_gate)
 
     @torch.no_grad()
     def compute_3D_filter(self, cameras):
@@ -790,6 +856,18 @@ class GaussianModel:
             mask_q = torch.round(mask_soft * 255).clamp(0, 255).to(torch.uint8)
             mask_q_f = mask_q.float().view(-1)
 
+            # mask_offset/motion_gate (experimental, not yet entropy-coded) must be
+            # re-sliced into this SAME keep+inv_perm canonical order and stored alongside
+            # rotation/opacity so conduct_decoding's reconstructed anchor count/order
+            # lines up -- otherwise they silently keep their pre-encoding N and crash (or
+            # worse, silently misalign) the next time they're indexed by visible_mask.
+            mask_offset_enc = None
+            if self.use_offset_mask and self._mask_offset.numel() > 0:
+                mask_offset_enc = self._mask_offset[keep][inv_perm].detach()
+            motion_gate_enc = None
+            if self.use_motion_gate and self._motion_gate.numel() > 0:
+                motion_gate_enc = self._motion_gate[keep][inv_perm].detach()
+
             # Entropy-code mask_q itself instead of storing it raw (flat 8 bits/anchor).
             # Its empirical distribution is heavily right-skewed -- most survivors sit just
             # above mask_prune_threshold, with a long tail toward 255 -- which a 2-component
@@ -827,6 +905,8 @@ class GaussianModel:
                 # conduct_decoding tell this apart from bitstreams written before offsets
                 # filtering existed, which coded the full dense tensor instead.
                 'offsets_filtered': True,
+                'mask_offset': mask_offset_enc.cpu() if mask_offset_enc is not None else None,
+                'motion_gate': motion_gate_enc.cpu() if motion_gate_enc is not None else None,
             }, os.path.join(path, 'uncoded_attrs.pt'))
 
             return {
@@ -941,6 +1021,17 @@ class GaussianModel:
             else:
                 mask_soft = uncoded['mask_q'].cuda().float() / 255
             self._mask_anchor = nn.Parameter(inverse_sigmoid(mask_soft.clamp(1e-6, 1 - 1e-6)).view(N, 1))
+
+            # Restore mask_offset/motion_gate (raw, uncoded -- see conduct_encoding) in
+            # the same N and canonical order as every other just-reconstructed per-anchor
+            # tensor above, so a stale pre-decode size never reaches a later indexing by
+            # visible_mask.
+            if uncoded.get('mask_offset') is not None:
+                self._mask_offset = nn.Parameter(uncoded['mask_offset'].cuda())
+                self.use_offset_mask = True
+            if uncoded.get('motion_gate') is not None:
+                self._motion_gate = nn.Parameter(uncoded['motion_gate'].cuda())
+                self.use_motion_gate = True
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -1155,6 +1246,7 @@ class GaussianModel:
             # anchors don't have this failure mode since only the camera varies iteration to
             # iteration, never "when". See adjust_anchor's rate_prune_mask.
             self.mask_val_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+            self.mask_val_last = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.photo_error_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
@@ -1338,6 +1430,11 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         if self.use_entropy_coding:
             l.append('mask_anchor')
+        if self.use_offset_mask and self._mask_offset.numel() > 0:
+            for i in range(self._mask_offset.shape[1]):
+                l.append('mask_offset_{}'.format(i))
+        if self.use_motion_gate and self._motion_gate.numel() > 0:
+            l.append('motion_gate')
         return l
 
     def save_ply(self, path):
@@ -1355,6 +1452,10 @@ class GaussianModel:
         to_cat = [anchor, offset, anchor_feat, opacities, scale, rotation]
         if self.use_entropy_coding:
             to_cat.append(self._mask_anchor.detach().cpu().numpy())
+        if self.use_offset_mask and self._mask_offset.numel() > 0:
+            to_cat.append(self._mask_offset.detach().cpu().numpy())
+        if self.use_motion_gate and self._motion_gate.numel() > 0:
+            to_cat.append(self._motion_gate.detach().cpu().numpy())
         attributes = np.concatenate(to_cat, axis=1)
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
         elements[:] = list(map(tuple, attributes))
@@ -1444,6 +1545,25 @@ class GaussianModel:
                 mask_anchor = np.full((anchor.shape[0], 1), MASK_INIT_LOGIT, dtype=np.float32)
             self._mask_anchor = nn.Parameter(torch.tensor(mask_anchor, dtype=torch.float, device="cuda").requires_grad_(True))
 
+        # mask_offset/motion_gate are allocated mid-training (see update_until in
+        # train.py) rather than through a constructor flag, so whether to restore them
+        # is inferred from the ply's own properties rather than self.use_offset_mask /
+        # self.use_motion_gate (which default to False on a freshly constructed model,
+        # e.g. the decode-time GaussianModel built for compressed-render evaluation).
+        ply_prop_names = [p.name for p in plydata.elements[0].properties]
+        mask_offset_names = [n for n in ply_prop_names if n.startswith("mask_offset_")]
+        if mask_offset_names:
+            mask_offset_names = sorted(mask_offset_names, key=lambda x: int(x.split('_')[-1]))
+            mask_offset = np.zeros((anchor.shape[0], len(mask_offset_names)), dtype=np.float32)
+            for idx, attr_name in enumerate(mask_offset_names):
+                mask_offset[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+            self._mask_offset = nn.Parameter(torch.tensor(mask_offset, dtype=torch.float, device="cuda").requires_grad_(True))
+            self.use_offset_mask = True
+        if "motion_gate" in ply_prop_names:
+            motion_gate = np.asarray(plydata.elements[0]["motion_gate"])[..., np.newaxis].astype(np.float32)
+            self._motion_gate = nn.Parameter(torch.tensor(motion_gate, dtype=torch.float, device="cuda").requires_grad_(True))
+            self.use_motion_gate = True
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -1508,7 +1628,11 @@ class GaussianModel:
         if self.use_entropy_coding:
             # accumulate this iteration's (view, time) sample's mask value -- averaged against
             # anchor_demon's matching visit count in adjust_anchor's rate_prune_mask
-            self.mask_val_accum[anchor_visible_mask] += self.get_mask_anchor[anchor_visible_mask].detach()
+            cur_mask_val = self.get_mask_anchor[anchor_visible_mask].detach()
+            self.mask_val_accum[anchor_visible_mask] += cur_mask_val
+            # ablation_no_time_agg_mask companion: overwrite (not +=) so this always
+            # holds just the latest visit's value, never an average.
+            self.mask_val_last[anchor_visible_mask] = cur_mask_val
 
         # update neural gaussian statis
         anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)
@@ -1771,6 +1895,10 @@ class GaussianModel:
                     del self.mask_val_accum
                     self.mask_val_accum = temp_mask_val_accum
 
+                    temp_mask_val_last = torch.cat([self.mask_val_last, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+                    del self.mask_val_last
+                    self.mask_val_last = temp_mask_val_last
+
                 torch.cuda.empty_cache()
                 
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -1862,7 +1990,14 @@ class GaussianModel:
             # excluded rather than defaulting to "prunable": mask_val_accum/anchor_demon would
             # otherwise read as 0 (below any positive threshold) for every one of them.
             visited = self.anchor_demon.squeeze(dim=1) > 0
-            mask_avg = (self.mask_val_accum / self.anchor_demon.clamp(min=1)).squeeze(dim=1)
+            if self.ablation_no_time_agg_mask:
+                # Ablation: use only the latest visit's instantaneous mask value
+                # (mask_val_last) instead of the time-aggregated average -- reintroduces
+                # the premature-pruning failure mode this feature exists to fix (see
+                # comment above).
+                mask_avg = self.mask_val_last.squeeze(dim=1)
+            else:
+                mask_avg = (self.mask_val_accum / self.anchor_demon.clamp(min=1)).squeeze(dim=1)
             rate_prune_mask = visited & (mask_avg < opt.mask_prune_threshold)
             prune_mask = torch.logical_or(prune_mask, rate_prune_mask)
         
@@ -1912,6 +2047,16 @@ class GaussianModel:
             temp_mask_val_accum = self.mask_val_accum[~prune_mask]
             del self.mask_val_accum
             self.mask_val_accum = temp_mask_val_accum
+
+            # mask_val_last is intentionally NOT zeroed alongside mask_val_accum above
+            # (anchors_mask branch) -- it must keep holding each anchor's real last-seen
+            # value between visits, not reset to 0 (which would read as "below any
+            # positive threshold" and cause spurious pruning before the anchor is next
+            # visited). Only shape-filtered here to track pruning, same as every other
+            # per-anchor buffer.
+            temp_mask_val_last = self.mask_val_last[~prune_mask]
+            del self.mask_val_last
+            self.mask_val_last = temp_mask_val_last
 
         temp_anchor_demon = self.anchor_demon[~prune_mask]
         del self.anchor_demon

@@ -112,8 +112,11 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     bit_per_param = None
     mask_anchor_soft = None
+    mask_offset_soft = None
     if pc.use_entropy_coding:
         mask_anchor_soft = pc.get_mask_anchor[visible_mask]  # [N_vis, 1], differentiable gate
+        if pc.use_offset_mask and pc._mask_offset.numel() > 0:
+            mask_offset_soft = pc.get_mask_offset[visible_mask]  # [N_vis, n_offsets]
 
     if is_training and pc.use_entropy_coding:
         if step == pc.entropy_start_iter:
@@ -175,6 +178,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
                 bit_feat = bit_feat * mask_chosen
                 bit_scaling = bit_scaling * mask_chosen
                 bit_offsets = bit_offsets * mask_chosen
+                if mask_offset_soft is not None:
+                    mask_offset_chosen = mask_offset_soft[choose_idx]
+                    bit_offsets = (bit_offsets.view(-1, pc.n_offsets, 4) *
+                                    mask_offset_chosen.unsqueeze(-1)).view(-1, pc.n_offsets * 4)
             else:
                 bit_feat = pc.entropy_gaussian(feat, mean_feat, scale_feat, Q_feat, x_mean=pc._anchor_feat.mean())
                 bit_scaling = pc.entropy_gaussian(grid_scaling, mean_scaling, scale_scaling, Q_scaling, x_mean=pc.get_scaling.mean())
@@ -186,6 +193,13 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
                 bit_feat = bit_feat * mask_anchor_soft
                 bit_scaling = bit_scaling * mask_anchor_soft
                 bit_offsets = bit_offsets * mask_anchor_soft
+                if mask_offset_soft is not None:
+                    # bit_offsets is [N_vis, 4*n_offsets] (per-element bits of the flattened
+                    # per-anchor offset block); reshape to [N_vis, n_offsets, 4] so each
+                    # offset slot's own mask gates just its 4 values, on top of the
+                    # anchor-wide mask_anchor_soft gating above.
+                    bit_offsets = (bit_offsets.view(-1, pc.n_offsets, 4) *
+                                    mask_offset_soft.unsqueeze(-1)).view(-1, pc.n_offsets * 4)
 
             bit_per_param = (bit_feat.sum() + bit_scaling.sum() + bit_offsets.sum()) / \
                             (bit_feat.numel() + bit_scaling.numel() + bit_offsets.numel())
@@ -268,6 +282,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     opacity = neural_opacity[mask]
 
     flow = pc.get_flow_mlp(cat_local_view_wodist_wodir).view([-1, _motion_coeff_dim(pc)])
+    if pc.use_motion_gate and pc._motion_gate.numel() > 0:
+        motion_gate_soft = pc.get_motion_gate[visible_mask]  # [N_vis, 1]
+        motion_gate_repeat = repeat(motion_gate_soft, 'n c -> (n k) c', k=pc.n_offsets)
+        flow = flow * motion_gate_repeat
 
     # get offset's color
     if pc.appearance_dim > 0:
@@ -298,10 +316,19 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         concatenated = torch.cat([grid_scaling, anchor, anchor_filter_3D], dim=-1)
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets, flow], dim=-1)
+    if mask_offset_soft is not None:
+        # mask_offset_soft is [N_vis, n_offsets]; flattening row-major (n, k) matches the
+        # (n k) ordering grid_offsets/color/scale_rot/flow are already reshaped into above.
+        mask_offset_flat = mask_offset_soft.reshape(-1, 1)
+        concatenated_all = torch.cat([concatenated_repeated, mask_offset_flat, color, scale_rot, offsets, flow], dim=-1)
+    else:
+        concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets, flow], dim=-1)
     masked = concatenated_all[mask]
     flow_dim = _motion_coeff_dim(pc)
-    if mask_anchor_soft is not None:
+    mask_offset_repeat = None
+    if mask_anchor_soft is not None and mask_offset_soft is not None:
+        scaling_repeat, repeat_anchor, mask_anchor_repeat, filter_3d_repeat, mask_offset_repeat, color, scale_rot, offsets, flow = masked.split([7, 4, 1, 1, 1, 3, 8, 4, flow_dim], dim=-1)
+    elif mask_anchor_soft is not None:
         scaling_repeat, repeat_anchor, mask_anchor_repeat, filter_3d_repeat, color, scale_rot, offsets, flow = masked.split([7, 4, 1, 1, 3, 8, 4, flow_dim], dim=-1)
     else:
         scaling_repeat, repeat_anchor, filter_3d_repeat, color, scale_rot, offsets, flow = masked.split([7, 4, 1, 3, 8, 4, flow_dim], dim=-1)
@@ -339,10 +366,12 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         ## cached branch in render() (which never sees mask_anchor_soft) silently skips this
         ## multiplication, which for use_entropy_coding=True models caused a ~14dB PSNR
         ## collapse (the actual root cause, superseding the earlier opacity_t>0.05 theory).
+        cached_opacity = opacity
         if mask_anchor_soft is not None:
-            global_cache["opacity"] = (opacity * mask_anchor_repeat).detach()
-        else:
-            global_cache["opacity"] = opacity.detach()
+            cached_opacity = cached_opacity * mask_anchor_repeat
+        if mask_offset_repeat is not None:
+            cached_opacity = cached_opacity * mask_offset_repeat
+        global_cache["opacity"] = cached_opacity.detach()
         global_cache["scaling"] = scaling.detach()
         global_cache["rot"] = rot.detach()
         global_cache["mask"] = mask.detach()
@@ -354,6 +383,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     opacity = opacity * opacity_t
     if mask_anchor_soft is not None:
         opacity = opacity * mask_anchor_repeat
+    if mask_offset_repeat is not None:
+        opacity = opacity * mask_offset_repeat
 
     if is_training:
         return xyz, color, opacity, scaling, rot, neural_opacity, mask, opacity_t, sigma, bit_per_param, flow

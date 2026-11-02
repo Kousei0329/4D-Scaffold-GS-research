@@ -31,8 +31,8 @@ class CameraDataset(Dataset):
                 image_load = Image.open(viewpoint_cam.image_path)
                 resized_image_rgb = PILtoTorch(image_load, viewpoint_cam.resolution)
             
-            viewpoint_image = resized_image_rgb[:3, ...].clamp(0.0, 1.0) 
-            if resized_image_rgb.shape[1] == 4:
+            viewpoint_image = resized_image_rgb[:3, ...].clamp(0.0, 1.0)
+            if resized_image_rgb.shape[0] == 4:
                 gt_alpha_mask = resized_image_rgb[3:4, ...]
                 viewpoint_image *= gt_alpha_mask
             else:

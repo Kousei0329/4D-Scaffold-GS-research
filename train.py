@@ -57,6 +57,8 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, render_cached, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.gaussian_model import MASK_INIT_LOGIT
+import torch.nn as nn
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -118,6 +120,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                               use_joint_4d_hash=dataset.use_joint_4d_hash,
                               use_hybrid_4d_hash=dataset.use_hybrid_4d_hash,
                               use_full_hybrid_4d_hash=dataset.use_full_hybrid_4d_hash,
+                              ablation_no_hash_context=dataset.ablation_no_hash_context,
+                              ablation_fixed_quant=dataset.ablation_fixed_quant,
+                              ablation_no_time_agg_mask=dataset.ablation_no_time_agg_mask,
                               motion_model=dataset.motion_model,
                               motion_basis_dim=dataset.motion_basis_dim)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
@@ -251,6 +256,33 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 # ~= 2e-9), so the loss can't keep pushing it toward overflow.
                 sigma_reg_loss = (flow_speed * torch.exp(-sigma.clamp(max=20.0))).mean()
                 loss = loss + opt.motion_sigma_reg_weight * sigma_reg_loss
+
+            # E-D3DGS-style local motion-smoothness regularization: encourages spatially
+            # close Gaussians to carry similar learned motion (flow), on top of whatever
+            # consistency the photometric loss alone induces. Computed on a random
+            # subsample (motion_smooth_sample Gaussians) since a full NxN distance matrix
+            # over every visible Gaussian this iteration would be too large; nearest
+            # neighbor within just that subsample is a cheap, unbiased-in-expectation
+            # stand-in for a true KNN graph. Position is detached (this loss should pull
+            # flow fields together, not move the Gaussians themselves).
+            if opt.motion_smooth_weight > 0 and flow is not None:
+                n_total = neural_xyz.shape[0]
+                sample_n = min(opt.motion_smooth_sample, n_total)
+                idx = torch.randperm(n_total, device=flow.device)[:sample_n]
+                pos_sub = neural_xyz[idx].detach()
+                flow_sub = flow[idx]
+                with torch.no_grad():
+                    dist = torch.cdist(pos_sub, pos_sub)
+                    dist.fill_diagonal_(float('inf'))
+                    nn_idx = dist.argmin(dim=1)
+                motion_smooth_loss = ((flow_sub - flow_sub[nn_idx]) ** 2).mean()
+                loss = loss + opt.motion_smooth_weight * motion_smooth_loss
+
+            if opt.motion_gate_weight > 0 and gaussians.use_motion_gate and gaussians._motion_gate.numel() > 0:
+                # Pushes the gate toward 0 (no motion) everywhere the photometric loss
+                # doesn't need it open, mirroring how the rate loss pushes mask_anchor
+                # toward 0 for anchors that aren't worth keeping.
+                loss = loss + opt.motion_gate_weight * gaussians.get_motion_gate.mean()
 
             if bit_per_param is not None:
                 # HAC++-style hash-grid rate loss: pushes encoding_xyz's STE-binarized +-1
@@ -392,7 +424,31 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     del gaussians.offset_time_accum
                     del gaussians.offset_denom
                     torch.cuda.empty_cache()
-                        
+
+                    # Allocate the offset-level mask now that anchor growing/pruning is
+                    # done (N is frozen for the rest of training), so its shape [N,
+                    # n_offsets] never needs to survive a grow/prune event. Added as its
+                    # own optimizer param group rather than through training_setup,
+                    # which already ran once at the start of training.
+                    if opt.use_offset_mask:
+                        gaussians.use_offset_mask = True
+                        N_frozen = gaussians.get_anchor.shape[0]
+                        mask_offset_init = torch.full(
+                            (N_frozen, gaussians.n_offsets), MASK_INIT_LOGIT, device="cuda")
+                        gaussians._mask_offset = nn.Parameter(mask_offset_init.requires_grad_(True))
+                        gaussians.optimizer.add_param_group(
+                            {'params': [gaussians._mask_offset], 'lr': opt.mask_lr, 'name': 'mask_offset'})
+
+                    # Same allocation pattern for the Ex4DGS-inspired per-anchor motion
+                    # gate (see motion_gate_weight's docstring in arguments/__init__.py).
+                    if opt.motion_gate_weight > 0:
+                        gaussians.use_motion_gate = True
+                        N_frozen = gaussians.get_anchor.shape[0]
+                        motion_gate_init = torch.full((N_frozen, 1), MASK_INIT_LOGIT, device="cuda")
+                        gaussians._motion_gate = nn.Parameter(motion_gate_init.requires_grad_(True))
+                        gaussians.optimizer.add_param_group(
+                            {'params': [gaussians._motion_gate], 'lr': opt.mask_lr, 'name': 'motion_gate'})
+
                 # Optimizer step
                 if iteration < opt.iterations:
                     if gaussians.motion_model != 'linear' or opt.force_grad_clip:
@@ -453,6 +509,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                               use_joint_4d_hash=dataset.use_joint_4d_hash,
                                               use_hybrid_4d_hash=dataset.use_hybrid_4d_hash,
                                               use_full_hybrid_4d_hash=dataset.use_full_hybrid_4d_hash,
+                                              ablation_no_hash_context=dataset.ablation_no_hash_context,
+                                              ablation_fixed_quant=dataset.ablation_fixed_quant,
+                                              ablation_no_time_agg_mask=dataset.ablation_no_time_agg_mask,
                               motion_model=dataset.motion_model,
                               motion_basis_dim=dataset.motion_basis_dim)
                         best_gaussians.load_ply_sparse_gaussian(os.path.join(best_online_path, "point_cloud.ply"))
@@ -526,6 +585,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                               use_joint_4d_hash=dataset.use_joint_4d_hash,
                                               use_hybrid_4d_hash=dataset.use_hybrid_4d_hash,
                                               use_full_hybrid_4d_hash=dataset.use_full_hybrid_4d_hash,
+                                              ablation_no_hash_context=dataset.ablation_no_hash_context,
+                                              ablation_fixed_quant=dataset.ablation_fixed_quant,
+                                              ablation_no_time_agg_mask=dataset.ablation_no_time_agg_mask,
                               motion_model=dataset.motion_model,
                               motion_basis_dim=dataset.motion_basis_dim)
                         best_scene = Scene(dataset, best_gaussians, load_iteration=best_iter, shuffle=False)
@@ -786,6 +848,9 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                               use_joint_4d_hash=dataset.use_joint_4d_hash,
                               use_hybrid_4d_hash=dataset.use_hybrid_4d_hash,
                               use_full_hybrid_4d_hash=dataset.use_full_hybrid_4d_hash,
+                              ablation_no_hash_context=dataset.ablation_no_hash_context,
+                              ablation_fixed_quant=dataset.ablation_fixed_quant,
+                              ablation_no_time_agg_mask=dataset.ablation_no_time_agg_mask,
                               motion_model=dataset.motion_model,
                               motion_basis_dim=dataset.motion_basis_dim)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)

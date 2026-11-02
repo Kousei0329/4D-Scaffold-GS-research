@@ -137,6 +137,24 @@ class ModelParams(ParamGroup):
         # grids (5 tables total). Mutually exclusive with use_joint_4d_hash/use_hybrid_4d_hash.
         # Only takes effect when use_entropy_coding is set.
         self.use_full_hybrid_4d_hash = False
+        # Ablation: drop the hash-grid context entirely. mlp_grid is fed a constant
+        # (zero) input instead of calc_interp_feat's hash features, so every anchor gets
+        # the same predicted mean/scale/Q regardless of its (x,y,z,t) -- i.e. no
+        # inter-anchor spatiotemporal context at all. use_intra_anchor_context (if set)
+        # still works normally on top of this. Only takes effect when use_entropy_coding
+        # is set; encoding_xyz is not constructed at all in this mode.
+        self.ablation_no_hash_context = False
+        # Ablation: skip the per-element adaptive quantization step (adaptive_Q's Q_adj
+        # MLP output is ignored) and always quantize at the fixed base step Q_base
+        # (1.0 / 0.001 / 0.2 for feat/scaling/offsets). Only takes effect when
+        # use_entropy_coding is set.
+        self.ablation_fixed_quant = False
+        # Ablation: prune anchors using only the CURRENT iteration's rate-distortion mask
+        # value (self.get_mask_anchor at the moment of the periodic prune check) instead
+        # of the running average over every (view, time) sample since the last check
+        # (mask_val_accum / anchor_demon). Only takes effect when use_entropy_coding is
+        # set.
+        self.ablation_no_time_agg_mask = False
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -255,6 +273,25 @@ class OptimizationParams(ParamGroup):
         # velocity; silently skipped (no-op) for 'basis'/'fourier' where they aren't.
         self.motion_sigma_reg_weight = 0.0
 
+        # E-D3DGS-style local motion-smoothness regularization: penalizes squared
+        # difference between a Gaussian's learned flow and its nearest neighbor's (within
+        # a random subsample), encouraging spatially close Gaussians to move similarly.
+        # See the sample computation in train.py's loss section.
+        self.motion_smooth_weight = 0.0
+        self.motion_smooth_sample = 4096
+
+        # Ex4DGS-inspired static/dynamic split: a learned per-anchor gate (sigmoid(logit),
+        # allocated once at update_until like use_offset_mask, since its shape [N, 1] must
+        # track the final frozen anchor count) multiplies the anchor's raw flow output
+        # before the motion displacement is computed. motion_gate_weight regularizes the
+        # gate toward 0 (no motion) unless the photometric loss needs it on, so truly
+        # static anchors can learn to fully suppress their own motion computation's
+        # contribution rather than relying on velocity/basis coefficients converging to
+        # exactly zero on their own. motion_gate_weight > 0 is both the switch (whether
+        # the gate is allocated at update_until) and its regularization strength, same
+        # convention as motion_sigma_reg_weight/flow_densify_threshold.
+        self.motion_gate_weight = 0.0
+
         # entropy coding (HAC-style hash-grid context model)
         self.lmbda = 0.001
         # Iterations over which lmbda ramps linearly from 0 to its target value after
@@ -274,6 +311,14 @@ class OptimizationParams(ParamGroup):
 
         self.mask_lr = 0.01
         self.mask_prune_threshold = 0.01
+
+        # Offset-level (sub-anchor) rate-distortion mask, gating opacity/bit_offsets per
+        # individual offset slot instead of per whole anchor (see get_mask_offset in
+        # gaussian_model.py). Only takes effect once anchor growing has finished
+        # (iteration == update_until in train.py), so its shape can track the final,
+        # frozen anchor count without needing to participate in the grow/prune lifecycle.
+        # Reuses mask_lr for its own optimizer param group.
+        self.use_offset_mask = False
 
         # Online best-checkpoint tracking: every best_ckpt_check_interval iterations (once
         # past entropy_start_iter), evaluate the test-set RD loss and, if it improves on the
