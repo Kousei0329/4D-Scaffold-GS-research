@@ -174,3 +174,43 @@ def decode_positions(path, device='cuda'):
     assert active_prefixes.shape[0] == N, \
         f"decoded {active_prefixes.shape[0]} leaves, expected {N} -- corrupt bitstream?"
     return active_prefixes
+
+
+def encode_positions_naive(anchor_int, path):
+    """ablation_no_anchor_coord_coding counterpart to encode_positions: packs each axis as
+    plain fixed-width bits (np.packbits, no arithmetic coding, no occupancy tree, no
+    context modeling) in the input's own order. Measures what the 4D hyperoctree context
+    coding above actually saves over "just write axis_bits_for(axis) bits per coordinate,
+    per anchor" -- the naive scheme every axis still needs since anchors don't sit at
+    arbitrary real-valued positions. Returns the identity permutation (anchor_int is never
+    reordered), unlike encode_positions' canonical-traversal perm."""
+    N, D = anchor_int.shape
+    axis_bits = [_axis_bits_for(anchor_int[:, a]) for a in range(D)]
+    anchor_int_cpu = anchor_int.cpu().numpy()
+    with open(path, 'wb') as f:
+        f.write(np.array([N, D], dtype=np.int64).tobytes())
+        f.write(np.array(axis_bits, dtype=np.int64).tobytes())
+        for a in range(D):
+            nbits = axis_bits[a]
+            # MSB-first per value, matching decode_positions_naive's reconstruction below.
+            shifts = np.arange(nbits - 1, -1, -1, dtype=np.int64)
+            bits = ((anchor_int_cpu[:, a:a + 1] >> shifts) & 1).astype(np.uint8).reshape(-1)
+            f.write(np.packbits(bits).tobytes())
+    return torch.arange(N, device=anchor_int.device)
+
+
+def decode_positions_naive(path, device='cuda'):
+    """Inverse of encode_positions_naive."""
+    with open(path, 'rb') as f:
+        N, D = (int(v) for v in np.frombuffer(f.read(16), dtype=np.int64))
+        axis_bits = [int(v) for v in np.frombuffer(f.read(8 * D), dtype=np.int64)]
+        cols = []
+        for a in range(D):
+            nbits = axis_bits[a]
+            nbytes = (N * nbits + 7) // 8
+            packed = np.frombuffer(f.read(nbytes), dtype=np.uint8)
+            bits = np.unpackbits(packed, count=N * nbits).reshape(N, nbits)
+            shifts = np.arange(nbits - 1, -1, -1, dtype=np.int64)
+            col = (bits.astype(np.int64) << shifts).sum(axis=1)
+            cols.append(col)
+    return torch.from_numpy(np.stack(cols, axis=1)).to(device)

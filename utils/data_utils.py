@@ -9,28 +9,39 @@ import numpy as np
 
 class CameraDataset(Dataset):
     
-    def __init__(self, viewpoint_stack, white_background, view_only=False, rgba=False):
+    def __init__(self, viewpoint_stack, white_background, view_only=False, rgba=False, cache_images=False):
         self.viewpoint_stack = viewpoint_stack
         self.bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
         self.view_only = view_only
         self.rgba = rgba
-        
+        # index -> uint8 copy of resized_image_rgb (i.e. PILtoTorch's output times 255,
+        # rounded back to the exact integer pixel values it read via np.array() -- so
+        # reading it back as float()/255.0 below reproduces the uncached value bit-for-
+        # bit, not merely approximately). See arguments/__init__.py's cache_images for
+        # why this is only safe at num_workers=0.
+        self._cache = {} if cache_images else None
+
     def __getitem__(self, index):
         viewpoint_cam = self.viewpoint_stack[index]
         if self.view_only:
             return None, viewpoint_cam
         if viewpoint_cam.meta_only:
-            if self.rgba:
-                with Image.open(viewpoint_cam.image_path) as image_load:
-                    im_data = np.array(image_load.convert("RGBA"))
-                norm_data = im_data / 255.0
-                arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + self.bg * (1 - norm_data[:, :, 3:4])
-                image_load = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
-                resized_image_rgb = PILtoTorch(image_load, viewpoint_cam.resolution)
+            if self._cache is not None and index in self._cache:
+                resized_image_rgb = self._cache[index].float() / 255.0
             else:
-                image_load = Image.open(viewpoint_cam.image_path)
-                resized_image_rgb = PILtoTorch(image_load, viewpoint_cam.resolution)
-            
+                if self.rgba:
+                    with Image.open(viewpoint_cam.image_path) as image_load:
+                        im_data = np.array(image_load.convert("RGBA"))
+                    norm_data = im_data / 255.0
+                    arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + self.bg * (1 - norm_data[:, :, 3:4])
+                    image_load = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+                    resized_image_rgb = PILtoTorch(image_load, viewpoint_cam.resolution)
+                else:
+                    image_load = Image.open(viewpoint_cam.image_path)
+                    resized_image_rgb = PILtoTorch(image_load, viewpoint_cam.resolution)
+                if self._cache is not None:
+                    self._cache[index] = (resized_image_rgb * 255.0).round().to(torch.uint8)
+
             viewpoint_image = resized_image_rgb[:3, ...].clamp(0.0, 1.0)
             if resized_image_rgb.shape[0] == 4:
                 gt_alpha_mask = resized_image_rgb[3:4, ...]

@@ -80,6 +80,18 @@ class ModelParams(ParamGroup):
         self.add_color_dist = False
 
         self.dataloader = False
+        # Perf: cache each (lazily-loaded, --dataloader) training image's decoded+resized
+        # pixels in RAM after its first access, keyed by dataset index, instead of
+        # re-decoding from disk via PIL every time it's resampled. Stored as uint8 (the
+        # same integer values PILtoTorch's np.array() reads, before its /255.0) to keep
+        # the cache's RAM footprint to 1x the dataset's decoded size rather than 4x
+        # (float32). Only meaningful when `dataloader` is set (the eager, no-dataloader
+        # path already decodes once via Camera.image and needs no help). Meant to be
+        # paired with --num_workers 0: with workers > 0, each worker process gets its OWN
+        # private copy of this dict (multiprocessing forks don't share a mutable dict
+        # across processes), multiplying the cache's RAM cost by num_workers instead of
+        # keeping it at 1x the dataset's decoded size.
+        self.cache_images = False
         self.time_duration = [0.0, 10.0]
         self.frame_ratio = 1.0
         self.max_init_t = 0.0
@@ -155,6 +167,13 @@ class ModelParams(ParamGroup):
         # (mask_val_accum / anchor_demon). Only takes effect when use_entropy_coding is
         # set.
         self.ablation_no_time_agg_mask = False
+        # Ablation: replace the 4D anisotropic hyperoctree anchor-coordinate coding
+        # (utils/octree_coding.py's encode_positions/decode_positions) with a naive
+        # fixed-width-per-axis packing (encode_positions_naive/decode_positions_naive) --
+        # no occupancy tree, no context modeling, no arithmetic coding. Only affects the
+        # anchor_geom.b bitstream (anchor position); feat/scaling/offsets coding is
+        # unchanged. Only takes effect when use_entropy_coding is set.
+        self.ablation_no_anchor_coord_coding = False
 
         super().__init__(parser, "Loading Parameters", sentinel)
 

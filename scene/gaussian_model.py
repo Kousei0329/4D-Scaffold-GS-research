@@ -30,7 +30,8 @@ from utils.arithmetic_coding import encode_gaussian_mixed_chunk, decode_gaussian
 from utils.arithmetic_coding import encode_gaussian_mixed, decode_gaussian_mixed
 from utils.arithmetic_coding import fit_gmm_1d_2comp
 from utils.arithmetic_coding import encode_binary, decode_binary
-from utils.octree_coding import encode_positions, decode_positions
+from utils.octree_coding import encode_positions, decode_positions, \
+    encode_positions_naive, decode_positions_naive
 
 # 4D anchor axes are (x, y, z, t). Default design: decompose the 4D anchor position into
 # every 3-axis combination and run one 3D GridEncoder per combination, then concatenate
@@ -184,6 +185,7 @@ class GaussianModel:
                  ablation_no_hash_context : bool = False,
                  ablation_fixed_quant : bool = False,
                  ablation_no_time_agg_mask : bool = False,
+                 ablation_no_anchor_coord_coding : bool = False,
                  motion_model : str = 'linear',
                  motion_basis_dim : int = 16,
                  ):
@@ -223,6 +225,7 @@ class GaussianModel:
         self.ablation_no_hash_context = ablation_no_hash_context
         self.ablation_fixed_quant = ablation_fixed_quant
         self.ablation_no_time_agg_mask = ablation_no_time_agg_mask
+        self.ablation_no_anchor_coord_coding = ablation_no_anchor_coord_coding
         self.motion_model = motion_model
         self.motion_basis_dim = motion_basis_dim
 
@@ -767,7 +770,8 @@ class GaussianModel:
             # perm maps FROM this original order TO the decoded order -- so to reorder INTO
             # decoded order we need its inverse (argsort(perm)), not perm itself.
             anchor_int, anchor_mins = self._anchor_to_int(anchor)
-            perm = encode_positions(anchor_int, os.path.join(path, 'anchor_geom.b'))
+            encode_fn = encode_positions_naive if self.ablation_no_anchor_coord_coding else encode_positions
+            perm = encode_fn(anchor_int, os.path.join(path, 'anchor_geom.b'))
             inv_perm = torch.argsort(perm)
             anchor, feat, scaling, offsets = anchor[inv_perm], feat[inv_perm], scaling[inv_perm], offsets[inv_perm]
             N = anchor.shape[0]
@@ -926,7 +930,8 @@ class GaussianModel:
         with torch.no_grad():
             uncoded = torch.load(os.path.join(path, 'uncoded_attrs.pt'))
             anchor_mins = uncoded['anchor_mins'].cuda()
-            anchor_int = decode_positions(os.path.join(path, 'anchor_geom.b'))
+            decode_fn = decode_positions_naive if self.ablation_no_anchor_coord_coding else decode_positions
+            anchor_int = decode_fn(os.path.join(path, 'anchor_geom.b'))
             anchor = self._int_to_anchor(anchor_int, anchor_mins)
             N = anchor.shape[0]
 

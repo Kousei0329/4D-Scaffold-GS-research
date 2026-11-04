@@ -35,6 +35,7 @@ class Scene:
         # white_background (otherwise transparent regions keep whatever raw RGB the
         # renderer wrote there, instead of actually respecting the flag).
         self.rgba = os.path.exists(os.path.join(args.source_path, "transforms_train.json"))
+        self.cache_images = args.cache_images
 
         if load_iteration:
             if load_iteration == -1:
@@ -112,8 +113,10 @@ class Scene:
 
     def getTrainCameras(self, scale=1.0, view_only=False, rgba=None):
         rgba = self.rgba if rgba is None else rgba
-        return CameraDataset(self.train_cameras[scale].copy(), self.white_background, view_only, rgba)
+        return CameraDataset(self.train_cameras[scale].copy(), self.white_background, view_only, rgba,
+                              cache_images=self.cache_images)
 
     def getTestCameras(self, scale=1.0, view_only=False, rgba=None):
         rgba = self.rgba if rgba is None else rgba
-        return CameraDataset(self.test_cameras[scale].copy(), self.white_background, view_only, rgba)
+        return CameraDataset(self.test_cameras[scale].copy(), self.white_background, view_only, rgba,
+                              cache_images=self.cache_images)
