@@ -23,6 +23,11 @@ RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.s
     && rm /tmp/miniconda.sh
 ENV PATH="$CONDA_DIR/bin:$PATH"
 
+# 新しいcondaはdefaultsチャンネル(pkgs/main, pkgs/r)のToS同意が無いと
+# 非対話環境では `conda env create` が止まる(environment.ymlのdefaultsチャンネル利用のため)
+RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
+    && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
 WORKDIR /workspace/4D-Scaffold-GS-research
 
 # 依存関係の変更が少ないファイルだけ先にCOPYしてレイヤーキャッシュを効かせる
