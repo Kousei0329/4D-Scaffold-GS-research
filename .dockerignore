@@ -1,0 +1,12 @@
+.git
+data
+outputs
+outputs*
+*.log
+wandb*
+__pycache__
+*__pycache__*
+*.pyc
+build/
+*build/*
+*.egg-info/
