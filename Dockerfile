@@ -34,6 +34,13 @@ WORKDIR /workspace/4D-Scaffold-GS-research
 COPY environment.yml ./
 COPY submodules ./submodules
 
+# docker build中はGPUが見えない(--gpusはrun時のオプションでbuildには効かない)ため、
+# submodules配下のCUDA拡張をビルドするtorch.utils.cpp_extensionがtorch.cuda経由で
+# アーキテクチャを自動検出できず `IndexError: list index out of range` で失敗する。
+# 対象GPUのcompute capabilityを明示しておく必要がある(Ampere世代、RTX 3090=8.6)。
+# 他のアーキテクチャのGPUで使う場合はここを調整(例: Turing追加なら "7.5;8.0;8.6+PTX")。
+ENV TORCH_CUDA_ARCH_LIST="8.6+PTX"
+
 RUN conda env create -f environment.yml && conda clean -afy
 
 # 拡張ビルドの確認(ここで失敗したらsubmodules個別インストールへ)
