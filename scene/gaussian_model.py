@@ -773,7 +773,15 @@ class GaussianModel:
             encode_fn = encode_positions_naive if self.ablation_no_anchor_coord_coding else encode_positions
             perm = encode_fn(anchor_int, os.path.join(path, 'anchor_geom.b'))
             inv_perm = torch.argsort(perm)
-            anchor, feat, scaling, offsets = anchor[inv_perm], feat[inv_perm], scaling[inv_perm], offsets[inv_perm]
+            feat, scaling, offsets = feat[inv_perm], scaling[inv_perm], offsets[inv_perm]
+            # Use the decoder's own reconstruction of the anchor positions (integer grid
+            # coords -> world, the exact float ops conduct_decoding performs), not the
+            # trained float positions, for every context computed below. Any anchor that is
+            # even slightly off the voxel/t grid (e.g. a 1-ulp difference between
+            # k*(voxel*16) from anchor_growing and (16k)*voxel here, or off-lattice init
+            # times) would otherwise give the encoder a different hash-grid context than the
+            # decoder, desynchronizing feat and the active-offset mask derived from it.
+            anchor = self._int_to_anchor(anchor_int[inv_perm], anchor_mins)
             N = anchor.shape[0]
 
             feat_context = self.calc_interp_feat(anchor)
@@ -1195,8 +1203,20 @@ class GaussianModel:
             torch.cuda.empty_cache()
 
         print(f'Initial voxel_size: {self.voxel_size}')
-        
-        
+
+        # Point clouds without per-point times (random Blender/D-NeRF init) used to get
+        # t ~ U(0, max_init_t) assigned AFTER voxelization, i.e. continuous, off the
+        # t_grid_size lattice. Every other anchor (pcd times, anchor_growing) sits on that
+        # lattice, and conduct_encoding's anchor_geom coding assumes it does: off-lattice t
+        # got silently rounded at decode, so the decoder's hash-grid context (mean/scale/Q)
+        # differed from the encoder's, decoded feat drifted, the active-offset mask
+        # recomputed from it disagreed, and decoding crashed on a missing offsets_<k>.b
+        # chunk. Sample the times up front instead so voxelize_sample snaps them to the
+        # lattice (and dedups) exactly like pcd-provided times. max_init_t=0 (default)
+        # keeps times=None and the old all-at-t=0 init unchanged.
+        if times is None and self.max_init_t > 0:
+            times = np.random.random((np.asarray(points).shape[0], 1)) * self.max_init_t
+
         points, times = self.voxelize_sample(points, times, voxel_size=self.voxel_size * init_voxel_scale, t_grid_size=self.t_grid_size)
         fused_point_cloud = torch.tensor(np.asarray(points)).float().cuda()
         offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 4)).float().cuda()
