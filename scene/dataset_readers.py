@@ -365,11 +365,17 @@ def readNerfSyntheticInfo(args, path, white_background, eval, extension=".png", 
         test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
+    num_pts = getattr(args, 'random_init_pts', 10_000)
     if ply_path is None:
         ply_path = os.path.join(path, "points3d.ply")
+        if num_pts != 10_000:
+            # The default 10k random init is cached as <dataset>/points3d.ply on first use and
+            # reused by every later run, so a different point count must not read (or
+            # overwrite) that shared file: generate it per run in the model dir instead.
+            os.makedirs(args.model_path, exist_ok=True)
+            ply_path = os.path.join(args.model_path, f"points3d_random{num_pts}.ply")
     if not os.path.exists(ply_path):
         # Since this data set has no colmap data, we start with random points
-        num_pts = 10_000
         print(f"Generating random point cloud ({num_pts})...")
         
         # We create random points inside the bounds of the synthetic Blender scenes
@@ -906,7 +912,114 @@ def readSTGColmapSceneInfo(path, images, eval, llffhold=8, multiview=False, dura
                            ply_path=totalply_path)
     return scene_info
 
+def readHyperNeRFSceneInfo(args, path, eval, ratio=0.5):
+    """HyperNeRF / Nerfies format (dataset.json + metadata.json + scene.json + camera/*.json
+    + rgb/<k>x/*.png + points.npy), e.g. the vrig-* scenes.
+
+    Follows the 4DGS (Wu et al.) hypernerf protocol for comparability: rgb/2x images
+    (ratio=0.5), train/test from dataset.json's train_ids/val_ids (vrig: left vs right
+    camera), time = warp_id / max(warp_id). Differences, all making the camera model more
+    faithful rather than changing the data/eval protocol:
+      * principal point offset and pixel_aspect_ratio are honored through the existing
+        cx/cy/fl_x/fl_y path (getProjectionMatrixCenterShift) instead of assuming a centered
+        principal point -- vrig-chicken's is 160px and vrig-3dprinter's 241px off-center at 1x.
+        Radial/tangential distortion is still ignored (as in 4DGS).
+      * world coordinates are normalized the HyperNeRF way, (x - scene.center) * scene.scale,
+        for both camera positions and points (rotations are unaffected).
+    Initial points come from the dataset's own points.npy (sparse COLMAP points in the same
+    world frame as the cameras), written to <model_path>/points_hypernerf.ply so the dataset
+    directory is never modified."""
+    with open(os.path.join(path, 'scene.json')) as f:
+        scene_json = json.load(f)
+    with open(os.path.join(path, 'metadata.json')) as f:
+        meta_json = json.load(f)
+    with open(os.path.join(path, 'dataset.json')) as f:
+        dataset_json = json.load(f)
+    center = np.asarray(scene_json['center'], dtype=np.float64)
+    coord_scale = float(scene_json['scale'])
+
+    all_ids = dataset_json['ids']
+    if len(dataset_json.get('val_ids', [])) == 0:
+        # Same fallback as 4DGS's Load_hyper_data (interp-style captures without a val split).
+        i_train = [i for i in range(len(all_ids)) if i % 4 == 0]
+        i_test = [i + 2 for i in i_train][:-1]
+        train_ids = [all_ids[i] for i in i_train]
+        test_ids = [all_ids[i] for i in i_test]
+    else:
+        train_ids = dataset_json['train_ids']
+        test_ids = dataset_json['val_ids']
+
+    max_warp = max(meta_json[i]['warp_id'] for i in all_ids)
+    img_dir = os.path.join(path, 'rgb', f'{int(round(1 / ratio))}x')
+
+    def make_cam(uid, im_id):
+        with open(os.path.join(path, 'camera', f'{im_id}.json')) as f:
+            cam = json.load(f)
+        orientation = np.asarray(cam['orientation'], dtype=np.float64)   # world -> camera rotation
+        position = (np.asarray(cam['position'], dtype=np.float64) - center) * coord_scale
+        R = orientation.T                                                # 3DGS convention: R = R_w2c^T
+        T = -orientation @ position                                      # w2c translation
+        full_w, full_h = cam['image_size']
+        width, height = int(round(full_w * ratio)), int(round(full_h * ratio))
+        fl_x = cam['focal_length'] * ratio
+        fl_y = cam['focal_length'] * cam.get('pixel_aspect_ratio', 1.0) * ratio
+        cx = cam['principal_point'][0] * ratio
+        cy = cam['principal_point'][1] * ratio
+        image_path = os.path.join(img_dir, f'{im_id}.png')
+        assert os.path.exists(image_path), f"Image {image_path} does not exist!"
+        image = np.empty(0) if args.dataloader else Image.open(image_path)
+        timestamp = meta_json[im_id]['warp_id'] / max_warp if max_warp > 0 else 0.0
+        return CameraInfo(uid=uid, R=R, T=T, fl_x=fl_x, fl_y=fl_y, cx=cx, cy=cy,
+                          FovY=focal2fov(fl_y, height), FovX=focal2fov(fl_x, width),
+                          image=image, depth=None, image_path=image_path, image_name=f'{im_id}.png',
+                          width=width, height=height, timestamp=timestamp)
+
+    def in_range(c):
+        return args.time_duration is None or (args.time_duration[0] <= c.timestamp <= args.time_duration[1])
+
+    train_cam_infos = [c for c in (make_cam(u, i) for u, i in enumerate(train_ids)) if in_range(c)]
+    test_cam_infos = [c for c in (make_cam(u, i) for u, i in enumerate(test_ids)) if in_range(c)]
+    if not eval:
+        train_cam_infos = train_cam_infos + test_cam_infos
+        test_cam_infos = []
+    print(f"HyperNeRF: {len(train_cam_infos)} train / {len(test_cam_infos)} test views, "
+          f"{max_warp + 1} time steps, image {train_cam_infos[0].width}x{train_cam_infos[0].height}")
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    # Initial points: 'colmap' = points3D_downsample2.ply, the 4DGS-protocol dense COLMAP
+    # reconstruction (fused MVS points voxel-downsampled to <=~40k by 4DGS's
+    # scripts/downsample_point.py; the authors' pregenerated files hold ~39k-99k points) that
+    # the compared methods (4DGS / Light4GS / ADC-GS) initialize from. 'npy' = the dataset's
+    # own sparse points.npy (~10k). 'auto' (default) uses the PLY when present. Both are in
+    # the raw HyperNeRF world frame, so the same (x - center) * scale normalization applies.
+    choice = getattr(args, 'hyper_init_points', 'auto')
+    colmap_ply = os.path.join(path, 'points3D_downsample2.ply')
+    if choice == 'colmap' or (choice == 'auto' and os.path.exists(colmap_ply)):
+        assert os.path.exists(colmap_ply), f"--hyper_init_points colmap but {colmap_ply} is missing"
+        raw = fetchPly(colmap_ply)
+        xyz_raw, rgb = np.asarray(raw.points, dtype=np.float64), np.asarray(raw.colors) * 255.0
+        src_name = 'points3D_downsample2.ply'
+    else:
+        xyz_raw = np.load(os.path.join(path, 'points.npy')).astype(np.float64)
+        rgb = np.full_like(xyz_raw, 128.0)
+        src_name = 'points.npy'
+    xyz = (xyz_raw - center) * coord_scale
+    print(f"HyperNeRF init points: {len(xyz)} from {src_name}")
+    os.makedirs(args.model_path, exist_ok=True)
+    ply_path = os.path.join(args.model_path, 'points_hypernerf.ply')
+    storePly(ply_path, xyz, rgb)
+    pcd = BasicPointCloud(points=xyz, colors=rgb / 255.0, normals=np.zeros_like(xyz), times=None)
+
+    return SceneInfo(point_cloud=pcd,
+                     train_cameras=train_cam_infos,
+                     test_cameras=test_cam_infos,
+                     nerf_normalization=nerf_normalization,
+                     ply_path=ply_path)
+
+
 sceneLoadTypeCallbacks = {
+    "HyperNeRF": readHyperNeRFSceneInfo,
     "Colmap": readColmapSceneInfo,
     "Blender": readNerfSyntheticInfo,
     "Technicolor": readColmapSceneInfoTechnicolor,

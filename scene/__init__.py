@@ -55,6 +55,9 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args, args.source_path, args.white_background, args.eval, ply_path=ply_path)
+        elif os.path.exists(os.path.join(args.source_path, "dataset.json")):
+            print("Found dataset.json file, assuming HyperNeRF/Nerfies data set!")
+            scene_info = sceneLoadTypeCallbacks["HyperNeRF"](args, args.source_path, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "colmap")):
             duration = 50 # technicolor
             scene_info = sceneLoadTypeCallbacks["Technicolor"](args, args.source_path, None, args.eval, duration=duration)

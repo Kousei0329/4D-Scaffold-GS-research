@@ -60,6 +60,9 @@ from scene import Scene, GaussianModel
 from scene.gaussian_model import MASK_INIT_LOGIT
 import torch.nn as nn
 from utils.general_utils import safe_state
+
+# Dataloader-shuffle seed used inside training(); overridden in __main__ only when --seed is given.
+TRAIN_SEED = 42
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -166,9 +169,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    torch.manual_seed(42)
+    torch.manual_seed(TRAIN_SEED)
     training_dataset = scene.getTrainCameras()
-    training_dataloader = DataLoader(training_dataset, batch_size=1, shuffle=True, num_workers=num_workers if dataset.dataloader else 0, collate_fn=lambda x: x, drop_last=True)
+    training_dataloader = DataLoader(training_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=num_workers if dataset.dataloader else 0, collate_fn=lambda x: x, drop_last=True)
     test_dataset = scene.getTestCameras()
     test_gt, test_view = test_dataset[pipe.vis_idx]
     test_gt = test_gt.cuda()
@@ -207,112 +210,130 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
             background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-            viewpoint_image, viewpoint_cam = batch_data[0]
-            viewpoint_image = viewpoint_image.cuda()
-            viewpoint_cam = viewpoint_cam.cuda()
+            # batch_size>1 (opt.batch_size): gradient accumulation over the B views in this
+            # batch -- each view is rendered and backpropagated separately with its loss scaled
+            # by 1/B, then a single optimizer step below. Densification statistics are collected
+            # per view and applied at the original training_statis call site, so B=1 is
+            # bit-for-bit the previous single-view behavior.
+            n_views = len(batch_data)
+            statis_inputs = []
+            loss_for_log = 0.0
+            for viewpoint_image, viewpoint_cam in batch_data:
+                viewpoint_image = viewpoint_image.cuda()
+                viewpoint_cam = viewpoint_cam.cuda()
             
-            # Render
-            if (iteration - 1) == debug_from:
-                pipe.debug = True
+                # Render
+                if (iteration - 1) == debug_from:
+                    pipe.debug = True
             
-            voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
-            retain_grad = (iteration < opt.update_until and iteration >= 0)
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, step=iteration)
+                voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
+                retain_grad = (iteration < opt.update_until and iteration >= 0)
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, step=iteration)
 
-            image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity, opacity_t, sigma, bit_per_param, neural_xyz, flow = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"], render_pkg["opacity_t"], render_pkg["sigma"], render_pkg["bit_per_param"], render_pkg["xyz"], render_pkg["flow"]
+                image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity, opacity_t, sigma, bit_per_param, neural_xyz, flow = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"], render_pkg["opacity_t"], render_pkg["sigma"], render_pkg["bit_per_param"], render_pkg["xyz"], render_pkg["flow"]
 
-            gt_image = viewpoint_image
-            Ll1 = l1_loss(image, gt_image)
-            # Per-pixel error map for the photometric-error densification signal (see
-            # training_statis/anchor_growing) -- detached, diagnostic only, not part of
-            # the backprop graph.
-            pixel_error_map = (image.detach() - gt_image).abs().mean(dim=0, keepdim=True)
+                gt_image = viewpoint_image
+                Ll1 = l1_loss(image, gt_image)
+                # Per-pixel error map for the photometric-error densification signal (see
+                # training_statis/anchor_growing) -- detached, diagnostic only, not part of
+                # the backprop graph.
+                pixel_error_map = (image.detach() - gt_image).abs().mean(dim=0, keepdim=True)
 
-            ssim_loss = (1.0 - ssim(image, gt_image))
-            scaling_reg = scaling.prod(dim=1).mean()
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+                ssim_loss = (1.0 - ssim(image, gt_image))
+                scaling_reg = scaling.prod(dim=1).mean()
+                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
-            # flow is None whenever use_flow=False; first 3 channels are a literal
-            # velocity only for 'linear'/'taylor_residual' motion models -- shared by both
-            # motion_sigma_reg_weight (below) and flow_densify_threshold (passed into
-            # training_statis further down), so computed once here regardless of which
-            # (if either) is actually enabled.
-            flow_speed = None
-            if flow is not None and gaussians.motion_model in ('linear', 'taylor_residual'):
-                flow_speed = flow[:, :3].norm(dim=-1, keepdim=True).detach()
+                # flow is None whenever use_flow=False; first 3 channels are a literal
+                # velocity only for 'linear'/'taylor_residual' motion models -- shared by both
+                # motion_sigma_reg_weight (below) and flow_densify_threshold (passed into
+                # training_statis further down), so computed once here regardless of which
+                # (if either) is actually enabled.
+                flow_speed = None
+                if flow is not None and gaussians.motion_model in ('linear', 'taylor_residual'):
+                    flow_speed = flow[:, :3].norm(dim=-1, keepdim=True).detach()
 
-            # Motion-magnitude temporal-sharpness regularization (see
-            # opt.motion_sigma_reg_weight's docstring in arguments/__init__.py).
-            if opt.motion_sigma_reg_weight > 0 and flow_speed is not None:
-                # sigma = ELU(x)+1 is unbounded above, and this loss's gradient always
-                # pushes sigma UP wherever flow_speed>0 -- nothing in it saturates, so
-                # with no strong enough opposing photometric gradient (e.g. right after
-                # densification creates fresh anchors with poorly-calibrated features),
-                # Adam can drive sigma to run away over thousands of steps. Once sigma
-                # overflows, opacity_t = exp(-|dt*sigma|^beta) can hit an exact 0 * inf
-                # for any anchor whose dt is exactly 0 (its own designated timestamp) =
-                # NaN. Confirmed via a real crash (NaN starting iteration 1610, right
-                # after update_from=1500's first densification). Clamping sigma here
-                # removes the gradient once it's already far past "fully narrow" (exp(-20)
-                # ~= 2e-9), so the loss can't keep pushing it toward overflow.
-                sigma_reg_loss = (flow_speed * torch.exp(-sigma.clamp(max=20.0))).mean()
-                loss = loss + opt.motion_sigma_reg_weight * sigma_reg_loss
+                # Motion-magnitude temporal-sharpness regularization (see
+                # opt.motion_sigma_reg_weight's docstring in arguments/__init__.py).
+                if opt.motion_sigma_reg_weight > 0 and flow_speed is not None:
+                    # sigma = ELU(x)+1 is unbounded above, and this loss's gradient always
+                    # pushes sigma UP wherever flow_speed>0 -- nothing in it saturates, so
+                    # with no strong enough opposing photometric gradient (e.g. right after
+                    # densification creates fresh anchors with poorly-calibrated features),
+                    # Adam can drive sigma to run away over thousands of steps. Once sigma
+                    # overflows, opacity_t = exp(-|dt*sigma|^beta) can hit an exact 0 * inf
+                    # for any anchor whose dt is exactly 0 (its own designated timestamp) =
+                    # NaN. Confirmed via a real crash (NaN starting iteration 1610, right
+                    # after update_from=1500's first densification). Clamping sigma here
+                    # removes the gradient once it's already far past "fully narrow" (exp(-20)
+                    # ~= 2e-9), so the loss can't keep pushing it toward overflow.
+                    sigma_reg_loss = (flow_speed * torch.exp(-sigma.clamp(max=20.0))).mean()
+                    loss = loss + opt.motion_sigma_reg_weight * sigma_reg_loss
 
-            # E-D3DGS-style local motion-smoothness regularization: encourages spatially
-            # close Gaussians to carry similar learned motion (flow), on top of whatever
-            # consistency the photometric loss alone induces. Computed on a random
-            # subsample (motion_smooth_sample Gaussians) since a full NxN distance matrix
-            # over every visible Gaussian this iteration would be too large; nearest
-            # neighbor within just that subsample is a cheap, unbiased-in-expectation
-            # stand-in for a true KNN graph. Position is detached (this loss should pull
-            # flow fields together, not move the Gaussians themselves).
-            if opt.motion_smooth_weight > 0 and flow is not None:
-                n_total = neural_xyz.shape[0]
-                sample_n = min(opt.motion_smooth_sample, n_total)
-                idx = torch.randperm(n_total, device=flow.device)[:sample_n]
-                pos_sub = neural_xyz[idx].detach()
-                flow_sub = flow[idx]
-                with torch.no_grad():
-                    dist = torch.cdist(pos_sub, pos_sub)
-                    dist.fill_diagonal_(float('inf'))
-                    nn_idx = dist.argmin(dim=1)
-                motion_smooth_loss = ((flow_sub - flow_sub[nn_idx]) ** 2).mean()
-                loss = loss + opt.motion_smooth_weight * motion_smooth_loss
+                # E-D3DGS-style local motion-smoothness regularization: encourages spatially
+                # close Gaussians to carry similar learned motion (flow), on top of whatever
+                # consistency the photometric loss alone induces. Computed on a random
+                # subsample (motion_smooth_sample Gaussians) since a full NxN distance matrix
+                # over every visible Gaussian this iteration would be too large; nearest
+                # neighbor within just that subsample is a cheap, unbiased-in-expectation
+                # stand-in for a true KNN graph. Position is detached (this loss should pull
+                # flow fields together, not move the Gaussians themselves).
+                if opt.motion_smooth_weight > 0 and flow is not None:
+                    n_total = neural_xyz.shape[0]
+                    sample_n = min(opt.motion_smooth_sample, n_total)
+                    idx = torch.randperm(n_total, device=flow.device)[:sample_n]
+                    pos_sub = neural_xyz[idx].detach()
+                    flow_sub = flow[idx]
+                    with torch.no_grad():
+                        dist = torch.cdist(pos_sub, pos_sub)
+                        dist.fill_diagonal_(float('inf'))
+                        nn_idx = dist.argmin(dim=1)
+                    motion_smooth_loss = ((flow_sub - flow_sub[nn_idx]) ** 2).mean()
+                    loss = loss + opt.motion_smooth_weight * motion_smooth_loss
 
-            if opt.motion_gate_weight > 0 and gaussians.use_motion_gate and gaussians._motion_gate.numel() > 0:
-                # Pushes the gate toward 0 (no motion) everywhere the photometric loss
-                # doesn't need it open, mirroring how the rate loss pushes mask_anchor
-                # toward 0 for anchors that aren't worth keeping.
-                loss = loss + opt.motion_gate_weight * gaussians.get_motion_gate.mean()
+                if opt.motion_gate_weight > 0 and gaussians.use_motion_gate and gaussians._motion_gate.numel() > 0:
+                    # Pushes the gate toward 0 (no motion) everywhere the photometric loss
+                    # doesn't need it open, mirroring how the rate loss pushes mask_anchor
+                    # toward 0 for anchors that aren't worth keeping.
+                    loss = loss + opt.motion_gate_weight * gaussians.get_motion_gate.mean()
 
-            if bit_per_param is not None:
-                # HAC++-style hash-grid rate loss: pushes encoding_xyz's STE-binarized +-1
-                # weights to skew toward one value, which is what lets save_hash_grid's
-                # Bernoulli arithmetic coder beat a flat 1 bit/weight. Normalized by the same
-                # per-anchor element count bit_per_param already averages over, so the two
-                # terms are on the same "bits per coded element" scale before lmbda scales them.
-                denom = gaussians.get_anchor.shape[0] * (gaussians.feat_dim + 8 + 4 * gaussians.n_offsets)
-                _, bit_hash_grid, _, _ = get_binary_vxl_size((gaussians.get_encoding_params() + 1) / 2)
-                # The rate loss (and, through it, the per-anchor RD mask's gradient -- mask
-                # multiplies every bit_* term) otherwise switches on at full lmbda strength
-                # the instant iteration crosses entropy_start_iter, while densification is
-                # still running (update_until). That abrupt, lambda-sized kick decides which
-                # marginal anchors the mask starts pruning at a moment when the network hasn't
-                # adapted to the rate term at all yet -- a threshold effect that can make the
-                # final RD point depend on lmbda non-monotonically (e.g. a slightly larger
-                # lmbda landing in a better basin than a smaller one). lmbda_ramp_iters ramps
-                # the effective lmbda linearly from 0 to opt.lmbda over that many iterations
-                # after entropy_start_iter instead, so mask/rate decisions settle in gradually.
-                # Default 0 reproduces the old abrupt on/off behavior exactly.
-                if opt.lmbda_ramp_iters > 0:
-                    ramp = min(1.0, max(0.0, (iteration - dataset.entropy_start_iter) / opt.lmbda_ramp_iters))
-                else:
-                    ramp = 1.0
-                loss = loss + (opt.lmbda * ramp) * (bit_per_param + bit_hash_grid / denom)
+                if bit_per_param is not None:
+                    # HAC++-style hash-grid rate loss: pushes encoding_xyz's STE-binarized +-1
+                    # weights to skew toward one value, which is what lets save_hash_grid's
+                    # Bernoulli arithmetic coder beat a flat 1 bit/weight. Normalized by the same
+                    # per-anchor element count bit_per_param already averages over, so the two
+                    # terms are on the same "bits per coded element" scale before lmbda scales them.
+                    denom = gaussians.get_anchor.shape[0] * (gaussians.feat_dim + 8 + 4 * gaussians.n_offsets)
+                    _, bit_hash_grid, _, _ = get_binary_vxl_size((gaussians.get_encoding_params() + 1) / 2)
+                    # The rate loss (and, through it, the per-anchor RD mask's gradient -- mask
+                    # multiplies every bit_* term) otherwise switches on at full lmbda strength
+                    # the instant iteration crosses entropy_start_iter, while densification is
+                    # still running (update_until). That abrupt, lambda-sized kick decides which
+                    # marginal anchors the mask starts pruning at a moment when the network hasn't
+                    # adapted to the rate term at all yet -- a threshold effect that can make the
+                    # final RD point depend on lmbda non-monotonically (e.g. a slightly larger
+                    # lmbda landing in a better basin than a smaller one). lmbda_ramp_iters ramps
+                    # the effective lmbda linearly from 0 to opt.lmbda over that many iterations
+                    # after entropy_start_iter instead, so mask/rate decisions settle in gradually.
+                    # Default 0 reproduces the old abrupt on/off behavior exactly.
+                    if opt.lmbda_ramp_iters > 0:
+                        ramp = min(1.0, max(0.0, (iteration - dataset.entropy_start_iter) / opt.lmbda_ramp_iters))
+                    else:
+                        ramp = 1.0
+                    loss = loss + (opt.lmbda * ramp) * (bit_per_param + bit_hash_grid / denom)
 
-            loss.backward()
+                if n_views > 1:
+                    loss = loss / n_views
+                loss.backward()
+                loss_for_log += loss.item()
+                if iteration < opt.update_until and iteration > opt.start_stat:
+                    statis_inputs.append((viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask, opacity_t, sigma, viewpoint_cam, neural_xyz, pixel_error_map, flow_speed))
             
             iter_end.record()
+            # training_report reads iter_start.elapsed_time(iter_end), which needs iter_end to
+            # have completed. The single-view loop used to get that for free from the
+            # loss.item() right after this point; with per-view loss.item() now inside the
+            # batch loop (before this record), synchronize explicitly.
+            iter_end.synchronize()
 
             with torch.no_grad():
                 if pipe.vis:
@@ -331,7 +352,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         gaussians.train()
 
                 # Progress bar
-                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+                ema_loss_for_log = 0.4 * loss_for_log + 0.6 * ema_loss_for_log
 
                 if iteration % 10 == 0:
                     progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "N": f"{len(scene.gaussians.get_anchor)}"})
@@ -411,7 +432,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 if iteration < opt.update_until and iteration > opt.start_stat:
                     # add statis
                     activate_DA = (iteration >= opt.da_start_iter)
-                    gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask, opacity_t, sigma, opt.lambda_temporal_sigma, viewpoint_cam.timestamp, opt, activate_DA, neural_xyz, pixel_error_map, viewpoint_cam, flow_speed)
+                    for (viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask, opacity_t, sigma, viewpoint_cam, neural_xyz, pixel_error_map, flow_speed) in statis_inputs:
+                        gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask, opacity_t, sigma, opt.lambda_temporal_sigma, viewpoint_cam.timestamp, opt, activate_DA, neural_xyz, pixel_error_map, viewpoint_cam, flow_speed)
                     
                     # densification
                     if iteration > opt.update_from and iteration % opt.update_interval == 0:
@@ -1011,6 +1033,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--gpu", type=str, default = '-1')
+    # Optional RNG seed for run-to-run variance studies. None (default) keeps the original
+    # fixed seeding exactly: safe_state()'s 0 for random/numpy/torch, then 42 for the
+    # dataloader shuffle inside training().
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--expname", type=str, default="")
     args = parser.parse_args(sys.argv[1:])
@@ -1060,6 +1086,13 @@ if __name__ == "__main__":
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
+    if args.seed is not None:
+        import random as _random
+        _random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        TRAIN_SEED = args.seed + 42
+        logger.info(f"Using RNG seed {args.seed} (dataloader shuffle seed {TRAIN_SEED})")
 
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)

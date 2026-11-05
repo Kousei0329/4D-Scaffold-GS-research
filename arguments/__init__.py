@@ -95,6 +95,12 @@ class ModelParams(ParamGroup):
         self.time_duration = [0.0, 10.0]
         self.frame_ratio = 1.0
         self.max_init_t = 0.0
+        # Number of random points for datasets without a point cloud (Blender/D-NeRF).
+        # 10000 = previous hard-coded value; 4DGS/4D-RotorGS use 100000 on D-NeRF.
+        self.random_init_pts = 10_000
+        # HyperNeRF initial point cloud: auto (points3D_downsample2.ply if present, else
+        # points.npy) | colmap | npy. See readHyperNeRFSceneInfo.
+        self.hyper_init_points = "auto"
         self.init_voxel_scale = 1.0
         self.ply_path = ''
 
@@ -195,6 +201,9 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
+        # Views per optimizer step (gradient accumulation, see train.py). 1 = original
+        # behavior. 4DGS (Yang et al.) uses 4 and 4D-RotorGS 3 on D-NeRF.
+        self.batch_size = 1
         self.position_lr_init = 0.0
         self.position_lr_final = 0.0
         self.position_lr_delay_mult = 0.01
