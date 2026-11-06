@@ -969,6 +969,10 @@ def readHyperNeRFSceneInfo(args, path, eval, ratio=0.5):
         assert os.path.exists(image_path), f"Image {image_path} does not exist!"
         image = np.empty(0) if args.dataloader else Image.open(image_path)
         timestamp = meta_json[im_id]['warp_id'] / max_warp if max_warp > 0 else 0.0
+        # --frame_ratio rescales the [0,1] time axis to [0, frame_ratio] (same convention as
+        # the Blender/Technicolor readers). The temporal-opacity / flow defaults were tuned on
+        # N3DV's 0-10 s axis; frame_ratio=1 (default) keeps the 4DGS-style [0,1] normalization.
+        timestamp *= getattr(args, 'frame_ratio', 1.0)
         return CameraInfo(uid=uid, R=R, T=T, fl_x=fl_x, fl_y=fl_y, cx=cx, cy=cy,
                           FovY=focal2fov(fl_y, height), FovX=focal2fov(fl_x, width),
                           image=image, depth=None, image_path=image_path, image_name=f'{im_id}.png',
