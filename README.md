@@ -63,6 +63,23 @@ pip install ./submodules/gridencoder
 pip install ./submodules/arithmetic
 ```
 
+### Docker(任意)
+
+ホストに直接condaで環境構築する代わりに、付属の`Dockerfile`でコンテナ化することもできます。ホスト側にNVIDIA Driver(CUDA 11.6以上対応)と`nvidia-container-toolkit`が入っていることが前提です。
+
+```bash
+docker build -t stac:latest .
+docker run --gpus all --shm-size=16g -it \
+  -v $(pwd):/workspace/4D-Scaffold-GS-research \
+  -v /path/to/N3DV:/workspace/data/N3DV \
+  stac:latest
+```
+
+- イメージは`RTX 3090 / Driver 570.158.01 / CUDA 11.6 toolkit`を基準にビルドしています。`submodules`配下のCUDA拡張は`docker build`時点ではGPUが見えない(`--gpus`はrun時のみ有効なオプションのため)ので、`Dockerfile`内の`TORCH_CUDA_ARCH_LIST`でターゲットGPUのcompute capabilityを明示しています(デフォルトはAmpere世代=`8.6+PTX`)。別世代のGPUで使う場合はこの値を書き換えてください(例: Turingを追加するなら`"7.5;8.0;8.6+PTX"`)。
+- conda環境名は`4d_scaffold_naitive`で、コンテナ起動時のシェルには自動で入ります(`conda run -n 4d_scaffold_naitive`経由)。
+- コンテナの`/dev/shm`が小さいと`DataLoader`のワーカーがバスエラーで落ちるため、`--shm-size`は8GB以上を推奨します(後述の`scripts/train_n3dv.sh`の`num_workers`の注記も参照)。
+- 通常は上記の`-v $(pwd):/workspace/4D-Scaffold-GS-research`のbind mountでソースを上書きして開発し、`COPY . .`でイメージに焼き込まれた内容は初回ビルド確認用として扱っています。
+
 ## データ
 
 まず、プロジェクトディレクトリ内に```data/```フォルダを作成します。
@@ -282,3 +299,12 @@ CVPR投稿論文向けのablation study用フラグ、Ex4DGS風のper-anchor mot
 - `--use_offset_mask`(デフォルト`False`): アンカー単位ではなくoffsetスロット単位でのレート歪みマスクを追加する
 - `scene/__init__.py`/`utils/data_utils.py`: `--white_background`が実質効いていなかったバグを修正。Blender/D-NeRF形式(`transforms_train.json`が存在する)データセットでは`Scene`が自動的に`rgba=True`を使うようにし、`CameraDataset.__getitem__`内のアルファマスク適用判定が間違った軸(`shape[1]`、実際はheight)を見ていたのを`shape[0]`(チャンネル数)に修正。既存のN3DVなどRGBのみのデータセットには影響なし
 - D-NeRFデータセット(`transforms_train.json`を使うBlender形式)は既存の`scene/dataset_readers.py`のローダーがそのまま動作することを確認(`hellwarrior`シーンで3000 iterのスモークテストが完走)。データ構成は下記「データ」セクションのD-NeRFの項を参照
+
+**2026-11-04**
+
+他のマシンでも環境構築できるよう、コンテナ化対応を追加しました。
+
+- `Dockerfile`(新規): `nvidia/cuda:11.6.2-devel-ubuntu20.04`をベースに、Miniconda経由で`environment.yml`の環境(`4d_scaffold_naitive`)を構築するコンテナ定義。上記「インストール」セクションのDocker項を参照
+  - 新しいconda(defaultsチャンネル)はToS同意が無いと非対話環境での`conda env create`が止まるため、`conda tos accept`を事前に実行
+  - `docker build`中は`--gpus`が効かずGPUが見えないため、`torch.utils.cpp_extension`がCUDAアーキテクチャを自動検出できず`IndexError: list index out of range`でCUDA拡張のビルドが失敗する。`TORCH_CUDA_ARCH_LIST`でターゲットGPUのcompute capabilityを明示することで対処(ビルド元のRTX 3090=Ampere=`8.6+PTX`をデフォルトに設定)
+- `.dockerignore`(新規): `.git`、`data`、`outputs`、ログなど、イメージに含める必要のないファイルを除外
