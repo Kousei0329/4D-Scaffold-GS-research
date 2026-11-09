@@ -88,6 +88,7 @@ class Scene:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
+        self.gaussians.set_quant_config(args)
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
         # print(f'self.cameras_extent: {self.cameras_extent}')

@@ -167,6 +167,18 @@ class ModelParams(ParamGroup):
         # (1.0 / 0.001 / 0.2 for feat/scaling/offsets). Only takes effect when
         # use_entropy_coding is set.
         self.ablation_fixed_quant = False
+        # Quantization base steps for feat / scaling / offsets (adaptive Q lives in
+        # [0.1, 2] x base). HAC/HAC++ defaults; scaling is in world units, so scenes whose
+        # coordinate scale differs (e.g. Technicolor, voxel_size 1e-4) should scale it with
+        # voxel_size (HAC: Q_scaling = voxel_size = 0.001).
+        self.q_feat_base = 1.0
+        self.q_scaling_base = 0.001
+        self.q_offsets_base = 0.2
+        # Pre-fix training noise (fixed base-width noise for the whole run, rate sampled from
+        # visible anchors). Default False = HAC++ behaviour: base-width noise only between
+        # noise_start_iter and entropy_start_iter, then noise of the ADAPTIVE Q width (so the
+        # distortion loss reaches Q_adj), and the rate term on a fresh 5% sample of all anchors.
+        self.legacy_quant_noise = False
         # Ablation: prune anchors using only the CURRENT iteration's rate-distortion mask
         # value (self.get_mask_anchor at the moment of the periodic prune check) instead
         # of the running average over every (view, time) sample since the last check

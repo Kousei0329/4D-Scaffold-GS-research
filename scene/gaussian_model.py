@@ -224,6 +224,13 @@ class GaussianModel:
         self.use_full_hybrid_4d_hash = use_full_hybrid_4d_hash
         self.ablation_no_hash_context = ablation_no_hash_context
         self.ablation_fixed_quant = ablation_fixed_quant
+        # Quantization base steps (HAC/HAC++ defaults 1.0 / 0.001 / 0.2) and the training-noise
+        # mode. Overridden from the run's ModelParams by set_quant_config() (called by Scene and
+        # by every direct GaussianModel reload in train.py) so encode/decode/eval use the same values.
+        self.q_feat_base = 1.0
+        self.q_scaling_base = 0.001
+        self.q_offsets_base = 0.2
+        self.legacy_quant_noise = False
         self.ablation_no_time_agg_mask = ablation_no_time_agg_mask
         self.ablation_no_anchor_coord_coding = ablation_no_anchor_coord_coding
         self.motion_model = motion_model
@@ -497,6 +504,12 @@ class GaussianModel:
             sizes.append(self.feat_dim)
         return torch.split(y, sizes, dim=-1)
 
+    def set_quant_config(self, args):
+        self.q_feat_base = float(getattr(args, "q_feat_base", 1.0))
+        self.q_scaling_base = float(getattr(args, "q_scaling_base", 0.001))
+        self.q_offsets_base = float(getattr(args, "q_offsets_base", 0.2))
+        self.legacy_quant_noise = bool(getattr(args, "legacy_quant_noise", False))
+
     def adaptive_Q(self, Q_base, Q_adj):
         # Ablation: skip the adaptive step entirely and always quantize at the fixed
         # base width. Q_adj is still predicted by mlp_grid upstream (unused dead weight
@@ -647,9 +660,9 @@ class GaussianModel:
                 mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
                     Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
 
-            Q_feat = self.adaptive_Q(1.0, Q_feat_adj)
-            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj)
-            Q_offsets = self.adaptive_Q(0.2, Q_offsets_adj)
+            Q_feat = self.adaptive_Q(self.q_feat_base, Q_feat_adj)
+            Q_scaling = self.adaptive_Q(self.q_scaling_base, Q_scaling_adj)
+            Q_offsets = self.adaptive_Q(self.q_offsets_base, Q_offsets_adj)
 
             feat_q = STE_multistep.apply(feat, Q_feat, feat.mean())
             scaling_q = STE_multistep.apply(scaling, Q_scaling, scaling.mean())
@@ -792,9 +805,9 @@ class GaussianModel:
                 mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
                     Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
 
-            Q_feat = self.adaptive_Q(1.0, Q_feat_adj).expand(N, self.feat_dim).contiguous()
-            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj).expand(N, 7).contiguous()
-            Q_offsets = self.adaptive_Q(0.2, Q_offsets_adj).expand(N, 4 * self.n_offsets).contiguous()
+            Q_feat = self.adaptive_Q(self.q_feat_base, Q_feat_adj).expand(N, self.feat_dim).contiguous()
+            Q_scaling = self.adaptive_Q(self.q_scaling_base, Q_scaling_adj).expand(N, 7).contiguous()
+            Q_offsets = self.adaptive_Q(self.q_offsets_base, Q_offsets_adj).expand(N, 4 * self.n_offsets).contiguous()
 
             feat_q = STE_multistep.apply(feat, Q_feat, feat.mean())
             scaling_q = STE_multistep.apply(scaling, Q_scaling, scaling.mean())
@@ -951,9 +964,9 @@ class GaussianModel:
                 mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
                     Q_feat_adj, Q_scaling_adj, Q_offsets_adj = self.forward_grid(feat_context)
 
-            Q_feat = self.adaptive_Q(1.0, Q_feat_adj).expand(N, self.feat_dim).contiguous()
-            Q_scaling = self.adaptive_Q(0.001, Q_scaling_adj).expand(N, 7).contiguous()
-            Q_offsets = self.adaptive_Q(0.2, Q_offsets_adj).expand(N, 4 * self.n_offsets).contiguous()
+            Q_feat = self.adaptive_Q(self.q_feat_base, Q_feat_adj).expand(N, self.feat_dim).contiguous()
+            Q_scaling = self.adaptive_Q(self.q_scaling_base, Q_scaling_adj).expand(N, 7).contiguous()
+            Q_offsets = self.adaptive_Q(self.q_offsets_base, Q_offsets_adj).expand(N, 4 * self.n_offsets).contiguous()
 
             if self.use_intra_anchor_context:
                 # Sequential per-channel-group decode, mirroring conduct_encoding: group

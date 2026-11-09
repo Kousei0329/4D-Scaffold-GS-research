@@ -302,7 +302,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     # Bernoulli arithmetic coder beat a flat 1 bit/weight. Normalized by the same
                     # per-anchor element count bit_per_param already averages over, so the two
                     # terms are on the same "bits per coded element" scale before lmbda scales them.
-                    denom = gaussians.get_anchor.shape[0] * (gaussians.feat_dim + 8 + 4 * gaussians.n_offsets)
+                    denom = gaussians.get_anchor.shape[0] * (gaussians.feat_dim + (8 if gaussians.legacy_quant_noise else 7) + 4 * gaussians.n_offsets)  # 7 = coded scaling dims (HAC++: feat_dim + its 6 + 3*n_offsets)
                     _, bit_hash_grid, _, _ = get_binary_vxl_size((gaussians.get_encoding_params() + 1) / 2)
                     # The rate loss (and, through it, the per-anchor RD mask's gradient -- mask
                     # multiplies every bit_* term) otherwise switches on at full lmbda strength
@@ -538,6 +538,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                               ablation_no_anchor_coord_coding=dataset.ablation_no_anchor_coord_coding,
                               motion_model=dataset.motion_model,
                               motion_basis_dim=dataset.motion_basis_dim)
+                        best_gaussians.set_quant_config(dataset)
                         best_gaussians.load_ply_sparse_gaussian(os.path.join(best_online_path, "point_cloud.ply"))
                         best_gaussians.load_mlp_checkpoints(best_online_path)
                         if not dataset.disable_mip_filter:

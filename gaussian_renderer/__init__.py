@@ -122,10 +122,17 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         if step == pc.entropy_start_iter:
             pc.update_anchor_bound()
 
-        if step > pc.noise_start_iter:
-            feat = feat + torch.empty_like(feat).uniform_(-0.5, 0.5) * 1.0
-            grid_scaling = grid_scaling + torch.empty_like(grid_scaling).uniform_(-0.5, 0.5) * 0.001
-            grid_offsets = grid_offsets + torch.empty_like(grid_offsets).uniform_(-0.5, 0.5) * 0.2
+        legacy = pc.legacy_quant_noise
+        qf0, qs0, qo0 = pc.q_feat_base, pc.q_scaling_base, pc.q_offsets_base
+        # HAC++: fixed base-width noise only in (noise_start_iter, entropy_start_iter]; after
+        # that, noise of the adaptive Q width (applied below, once Q is predicted). The legacy
+        # mode kept base-width noise for the whole run, so the eval/coding quantizer (adaptive
+        # Q, which then saturated at 2x base because only the rate loss reached Q_adj) was
+        # twice as coarse as anything seen in training.
+        if step > pc.noise_start_iter and (legacy or step <= pc.entropy_start_iter):
+            feat = feat + torch.empty_like(feat).uniform_(-0.5, 0.5) * qf0
+            grid_scaling = grid_scaling + torch.empty_like(grid_scaling).uniform_(-0.5, 0.5) * qs0
+            grid_offsets = grid_offsets + torch.empty_like(grid_offsets).uniform_(-0.5, 0.5) * qo0
 
         if step > pc.entropy_start_iter:
             feat_context = pc.calc_interp_feat(anchor)
@@ -136,13 +143,58 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
                 mean_feat, scale_feat, mean_scaling, scale_scaling, mean_offsets, scale_offsets, \
                     Q_feat_adj, Q_scaling_adj, Q_offsets_adj = pc.forward_grid(feat_context)
 
-            Q_feat = pc.adaptive_Q(1.0, Q_feat_adj)
-            Q_scaling = pc.adaptive_Q(0.001, Q_scaling_adj)
-            Q_offsets = pc.adaptive_Q(0.2, Q_offsets_adj)
+            Q_feat = pc.adaptive_Q(qf0, Q_feat_adj)
+            Q_scaling = pc.adaptive_Q(qs0, Q_scaling_adj)
+            Q_offsets = pc.adaptive_Q(qo0, Q_offsets_adj)
 
-            grid_offsets_flat = grid_offsets.reshape(anchor.shape[0], -1)  # [N_vis, 4*n_offsets]
+            if not legacy:
+                # HAC++ "for rendering": uniform noise of the adaptive step, so the rendered
+                # (distortion) loss sees the same quantization strength the decoder will apply
+                # and back-propagates into Q_adj (pulling Q down where precision matters).
+                feat = feat + torch.empty_like(feat).uniform_(-0.5, 0.5) * Q_feat
+                grid_scaling = grid_scaling + torch.empty_like(grid_scaling).uniform_(-0.5, 0.5) * Q_scaling
+                grid_offsets = grid_offsets + torch.empty_like(grid_offsets).uniform_(-0.5, 0.5) * Q_offsets.unsqueeze(1)
 
-            if pc.use_intra_anchor_context:
+            grid_offsets_flat = grid_offsets.reshape(anchor.shape[0], 4 * pc.n_offsets)  # [N_vis, 4*n_offsets]
+
+            if pc.use_intra_anchor_context and not legacy:
+                # HAC++ "for entropy": a fresh 5% sample of ALL anchors (not just the visible
+                # ones), raw parameters + their own adaptive-Q noise, with the hash-grid
+                # prediction recomputed for that sample.
+                n_all = pc.get_anchor.shape[0]
+                choose_idx = torch.rand(n_all, device=feat.device) <= 0.05
+                anchor_c = pc.get_anchor[choose_idx]
+                ctx_c = pc.calc_interp_feat(anchor_c)
+                mean_feat_c, scale_feat_c, mean_scaling_c, scale_scaling_c, mean_offsets_c, scale_offsets_c, \
+                    Q_feat_adj_c, Q_scaling_adj_c, Q_offsets_adj_c, prob_feat_c = pc.forward_grid(ctx_c)
+                Q_feat_c = pc.adaptive_Q(qf0, Q_feat_adj_c)
+                Q_scaling_c = pc.adaptive_Q(qs0, Q_scaling_adj_c)
+                Q_offsets_c = pc.adaptive_Q(qo0, Q_offsets_adj_c)
+                feat_c = pc._anchor_feat[choose_idx]
+                feat_c = feat_c + torch.empty_like(feat_c).uniform_(-0.5, 0.5) * Q_feat_c
+                scaling_c = pc.get_scaling[choose_idx]
+                scaling_c = scaling_c + torch.empty_like(scaling_c).uniform_(-0.5, 0.5) * Q_scaling_c
+                offsets_c = pc._offset[choose_idx].reshape(anchor_c.shape[0], 4 * pc.n_offsets)
+                offsets_c = offsets_c + torch.empty_like(offsets_c).uniform_(-0.5, 0.5) * Q_offsets_c
+                mean_adj, scale_adj, prob_adj = pc.mlp_channel_ctx(
+                    feat_c, torch.cat([mean_feat_c, scale_feat_c, prob_feat_c], dim=-1))
+                probs = torch.softmax(torch.stack([prob_feat_c, prob_adj], dim=-1), dim=-1)
+                bit_feat = pc.entropy_gaussian_mix(feat_c, mean_feat_c, mean_adj, scale_feat_c, scale_adj,
+                                                    probs[..., 0], probs[..., 1], Q_feat_c,
+                                                    x_mean=pc._anchor_feat.mean())
+                bit_scaling = pc.entropy_gaussian(scaling_c, mean_scaling_c, scale_scaling_c, Q_scaling_c,
+                                                   x_mean=pc.get_scaling.mean())
+                bit_offsets = pc.entropy_gaussian(offsets_c, mean_offsets_c, scale_offsets_c, Q_offsets_c,
+                                                   x_mean=pc._offset.mean())
+                mask_chosen = pc.get_mask_anchor[choose_idx]
+                bit_feat = bit_feat * mask_chosen
+                bit_scaling = bit_scaling * mask_chosen
+                bit_offsets = bit_offsets * mask_chosen
+                if mask_offset_soft is not None:
+                    mask_offset_chosen = pc.get_mask_offset[choose_idx]
+                    bit_offsets = (bit_offsets.view(-1, pc.n_offsets, 4) *
+                                    mask_offset_chosen.unsqueeze(-1)).view(-1, pc.n_offsets * 4)
+            elif pc.use_intra_anchor_context:
                 # Teacher-forced: all channel groups computed at once from the TRUE
                 # (already quantized) feat, since every group's ground truth is available
                 # during training -- unlike real encode/decode, which must go sequentially.
@@ -213,9 +265,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         else:
             _, _, _, _, _, _, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = pc.forward_grid(feat_context)
 
-        Q_feat = pc.adaptive_Q(1.0, Q_feat_adj)
-        Q_scaling = pc.adaptive_Q(0.001, Q_scaling_adj)
-        Q_offsets = pc.adaptive_Q(0.2, Q_offsets_adj).unsqueeze(1)  # broadcast over n_offsets
+        Q_feat = pc.adaptive_Q(pc.q_feat_base, Q_feat_adj)
+        Q_scaling = pc.adaptive_Q(pc.q_scaling_base, Q_scaling_adj)
+        Q_offsets = pc.adaptive_Q(pc.q_offsets_base, Q_offsets_adj).unsqueeze(1)  # broadcast over n_offsets
 
         feat = STE_multistep.apply(feat, Q_feat, pc._anchor_feat.mean())
         grid_scaling = STE_multistep.apply(grid_scaling, Q_scaling, pc.get_scaling.mean())
