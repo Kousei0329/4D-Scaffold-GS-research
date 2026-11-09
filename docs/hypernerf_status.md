@@ -9,6 +9,8 @@
 - 修正版の30kは、旧版の120k(28.13 dB / 3.83 MB)より画質が高くサイズが小さい。30k時点でもまだ伸びている。
 - ADC-GS の chicken 低レート点(29.61 dB / 3.85 MB)には **まだ 1.3 dB 届いていない**。非圧縮の 4D-Scaffold(60k)が 29.17 dB なので、圧縮による損失と、ベース自体の差の両方がある。
 - **修正版のレシピはまだ chicken でしか試していない。** 3dprinter / peel-banana / broom は旧版の数値だけ。他PCでの実行用に `scripts/run_hypernerf_qfix.sh` を用意済み。
+- **他PC(RTX 5080)で、修正版のレシピを 4 シーン × 5 つの λ、120k で実行中**(2026-11-09 09:20 UTC 開始)。詳細は 8 章。
+- 同じレシピの 30k を他PCで回したところ、chicken の λ = 0.01 は test RD 選択で **12k が選ばれて 27.42 dB** になった。30k 時点の圧縮前の評価は 28.66 dB だった。チェックポイント選択の影響がかなり大きい(8.3 節)。
 
 ## 2. 評価プロトコル
 
@@ -103,6 +105,57 @@ ADC-GS の行は論文の表にラベルがないため、論文中の平均値�
 2. chicken の修正版は30kでもまだ伸びているので、60k〜120k で回す。Technicolor では120k回すと、画質はほぼ同じでサイズが約1.6 MB 減った。
 3. λ を振って RD カーブを作り、ADC-GS と同じサイズで比べる。
 4. 非圧縮でも ADC-GS に 0.4〜0.5 dB 負けている(chicken 29.17 vs 29.61)。ベース側の改善も必要。
+
+## 8. 他PC(RTX 5080)での実行状況(2026-11-09 09:35 UTC 時点)
+
+7 章の 1〜3(残り 3 シーン、120k、λ を振る)をまとめて実行している。
+
+### 8.1 実行内容
+
+```bash
+LAMBDAS="0.01 0.05"      ITERATIONS=120000 bash scripts/run_hypernerf_qfix.sh 0 vrig-chicken vrig-3dprinter broom2 vrig-peel-banana
+LAMBDAS="0.02 0.03 0.04" ITERATIONS=120000 bash scripts/run_hypernerf_qfix.sh 0 vrig-chicken vrig-3dprinter broom2 vrig-peel-banana
+# 出力: outputs/HyperNeRF/<scene>/baseline_pccolmap_it120000_mit1.0_uu25k_qfix_qs1e-4/lmbda_<λ>/
+```
+
+- 3 章のレシピをそのまま使い、`ITERATIONS=120000` だけ変えている。
+- `update_until` はレシピの EXTRA で 25000 に固定されているので、120k でも 25k のまま。この扱いは未検討。
+- 先に λ = 0.01 / 0.05 を 4 シーンで回し、そのあと 0.02 / 0.03 / 0.04 を回す。合計 20 本。
+- 1 本約 1.5〜2 時間(chicken は 18〜40 it/s)なので、全部終わるのは 11/10〜11/11 ごろの見込み。
+- 2026-11-09 09:35 時点では chicken の λ = 0.01 が 19k / 120k まで進んでいる。120k の結果はまだ出ていない。
+
+### 8.2 データ準備
+
+- 画像は公式リリース(google/hypernerf v0.1)の `vrig_*.zip` を使った。
+- `points3D_downsample2.ply` は、4DGS の README にある配布ファイルをそのまま使った(Google Drive の `hypernerf-pcd.zip`、ID `1fUHiSgimVjVQZ2OOzTFtz02E9EqCoWr5`)。
+
+| 配布ファイル内のフォルダ | 置き場所 | 点数 |
+|---|---|---|
+| `virg/virg-chickchicken` | `vrig-chicken` | 80,418 |
+| `virg/virg-3dprinter` | `vrig-3dprinter` | 96,466 |
+| `virg/broom2` | `broom2` | 38,569 |
+| `virg/peel-banana` | `vrig-peel-banana` | 99,108 |
+
+- どのシーンも、`points.npy` と座標の範囲(5〜95 パーセンタイル)が重なることを確認した。
+- 最初は COLMAP を回して自分で点群を作っていた(4DGS の手順で 40k 点以下に間引いたもの。chicken は 36,793 点)。配布ファイルとは別物なので使うのをやめた。
+  - その点群で学習した run は他PCの `outputs_failed/hypernerf_selfmade_colmap_ply/` に移した。
+  - 参考までに、自作の点群での chicken 30k は、λ = 0.01 が 28.03 dB / 2.67 MB、λ = 0.05 が 27.41 dB / 1.41 MB(どちらも 30k が選ばれた)。
+
+### 8.3 他PCでの 30k の結果(120k に切り替える前に回した分)
+
+| シーン | 初期点群 | λ | 選ばれた iteration | PSNR | SSIM | ALEX | サイズ |
+|---|---|---|---|---|---|---|---|
+| chicken | 配布版(80,418 点) | 0.01 | 12k(online) | 27.42 | 0.833 | 0.211 | 2.83 MB |
+
+学習中に評価した test PSNR(圧縮前)の推移:
+
+| iteration | 7.5k | 15k | 22.5k | 30k |
+|---|---|---|---|---|
+| PSNR | 26.20 | 27.84 | 28.33 | 28.66 |
+
+- 3 章と同じレシピなのに、4 章の 28.27 dB / 3.49 MB(30k)より 0.85 dB 低い。違いは選ばれたチェックポイントで、こちらは online best に 12k が選ばれた。
+- 30k 時点の圧縮前の評価は 28.66 dB なので、最終のモデルを使えば 28.3 dB 前後かそれ以上が期待できる。
+- 120k の run では、online best とは別に最終のチェックポイントでも評価する予定。
 
 ## 付録:結果の場所
 
