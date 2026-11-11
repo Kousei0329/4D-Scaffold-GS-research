@@ -1,0 +1,12 @@
+{
+ "scene": "Train",
+ "method": "4dscaffold_nocomp",
+ "run_dir": "/workspace/data/outputs_4dscaffold/technicolor_50/Train/train_technicolor_sh/nocomp",
+ "eval_folder": "ours_120000",
+ "size_MB": 325.4312,
+ "size_note": "size of point_cloud/iteration_120000 (uncompressed ply + MLPs)",
+ "SSIM": 0.9486325979232788,
+ "PSNR": 32.9232292175293,
+ "LPIPS": 0.0648593008518219,
+ "ALEX": 0.0278181005269289
+}

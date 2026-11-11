@@ -1,0 +1,12 @@
+{
+ "scene": "Fabien",
+ "method": "4dscaffold_nocomp",
+ "run_dir": "/workspace/data/outputs_4dscaffold/technicolor_50/Fabien/train_technicolor_sh/nocomp",
+ "eval_folder": "ours_120000",
+ "size_MB": 135.3432,
+ "size_note": "size of point_cloud/iteration_120000 (uncompressed ply + MLPs)",
+ "SSIM": 0.9015417695045471,
+ "PSNR": 35.04303741455078,
+ "LPIPS": 0.2537941634654999,
+ "ALEX": 0.11898346245288849
+}

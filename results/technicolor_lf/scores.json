@@ -1,0 +1,102 @@
+[
+ {
+  "scene": "Train",
+  "method": "stac_lambda0.01",
+  "PSNR": 32.8038444519043,
+  "SSIM": 0.9409274458885193,
+  "LPIPS_ALEX": 0.04425324127078056,
+  "LPIPS_VGG": 0.08696281164884567,
+  "size_MB": 7.4158,
+  "eval_folder": "ours_112000_online_compressed"
+ },
+ {
+  "scene": "Train",
+  "method": "4dscaffold_nocomp",
+  "PSNR": 32.9232292175293,
+  "SSIM": 0.9486325979232788,
+  "LPIPS_ALEX": 0.0278181005269289,
+  "LPIPS_VGG": 0.0648593008518219,
+  "size_MB": 325.43123626708984,
+  "eval_folder": "ours_120000"
+ },
+ {
+  "scene": "Theater",
+  "method": "stac_lambda0.01",
+  "PSNR": 31.326801300048828,
+  "SSIM": 0.8933547139167786,
+  "LPIPS_ALEX": 0.12505550682544708,
+  "LPIPS_VGG": 0.22565802931785583,
+  "size_MB": 4.3274,
+  "eval_folder": "ours_100000_online_compressed"
+ },
+ {
+  "scene": "Theater",
+  "method": "4dscaffold_nocomp",
+  "PSNR": 32.29716491699219,
+  "SSIM": 0.8996356129646301,
+  "LPIPS_ALEX": 0.08655935525894165,
+  "LPIPS_VGG": 0.18662434816360474,
+  "size_MB": 253.39244842529297,
+  "eval_folder": "ours_120000"
+ },
+ {
+  "scene": "Birthday",
+  "method": "stac_lambda0.01",
+  "PSNR": 32.69065856933594,
+  "SSIM": 0.9438396692276001,
+  "LPIPS_ALEX": 0.03962395712733269,
+  "LPIPS_VGG": 0.09327176213264465,
+  "size_MB": 8.1397,
+  "eval_folder": "ours_116000_online_compressed"
+ },
+ {
+  "scene": "Birthday",
+  "method": "4dscaffold_nocomp",
+  "PSNR": 32.30174255371094,
+  "SSIM": 0.9479396343231201,
+  "LPIPS_ALEX": 0.02987769991159439,
+  "LPIPS_VGG": 0.07992759346961975,
+  "size_MB": 751.7389764785767,
+  "eval_folder": "ours_120000"
+ },
+ {
+  "scene": "Painter",
+  "method": "stac_lambda0.01",
+  "PSNR": 36.844444274902344,
+  "SSIM": 0.9336552619934082,
+  "LPIPS_ALEX": 0.07970817387104034,
+  "LPIPS_VGG": 0.15934337675571442,
+  "size_MB": 3.6344,
+  "eval_folder": "ours_118000_online_compressed"
+ },
+ {
+  "scene": "Painter",
+  "method": "4dscaffold_nocomp",
+  "PSNR": 37.43226623535156,
+  "SSIM": 0.9418860673904419,
+  "LPIPS_ALEX": 0.06767705082893372,
+  "LPIPS_VGG": 0.14125685393810272,
+  "size_MB": 349.5014581680298,
+  "eval_folder": "ours_120000"
+ },
+ {
+  "scene": "Fabien",
+  "method": "stac_lambda0.01",
+  "PSNR": 34.318660736083984,
+  "SSIM": 0.8772895932197571,
+  "LPIPS_ALEX": 0.16651609539985657,
+  "LPIPS_VGG": 0.3163056969642639,
+  "size_MB": 1.5921,
+  "eval_folder": "ours_118000_online_compressed"
+ },
+ {
+  "scene": "Fabien",
+  "method": "4dscaffold_nocomp",
+  "PSNR": 35.04303741455078,
+  "SSIM": 0.9015417695045471,
+  "LPIPS_ALEX": 0.11898346245288849,
+  "LPIPS_VGG": 0.2537941634654999,
+  "size_MB": 135.34319305419922,
+  "eval_folder": "ours_120000"
+ }
+]

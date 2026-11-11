@@ -1,0 +1,12 @@
+{
+ "scene": "Birthday",
+ "method": "4dscaffold_nocomp",
+ "run_dir": "/workspace/data/outputs_4dscaffold/technicolor_50/Birthday/train_technicolor_sh/nocomp",
+ "eval_folder": "ours_120000",
+ "size_MB": 751.739,
+ "size_note": "size of point_cloud/iteration_120000 (uncompressed ply + MLPs)",
+ "SSIM": 0.9479396343231201,
+ "PSNR": 32.30174255371094,
+ "LPIPS": 0.07992759346961975,
+ "ALEX": 0.02987769991159439
+}
