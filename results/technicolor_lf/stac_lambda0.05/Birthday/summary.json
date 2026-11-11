@@ -1,0 +1,12 @@
+{
+ "scene": "Birthday",
+ "method": "stac_lambda0.05",
+ "run_dir": "/workspace/data/outputs_4dscaffold/technicolor_50/Birthday/train_technicolor_sh/stac_lmbda_0.05_tg0.02_gth0.0002_pdt0.1_qfix_qs1e-4_120k",
+ "eval_folder": "ours_112000_online_compressed",
+ "size_MB": 4.6569,
+ "size_note": "compressed bitstream size (decoded model rendered)",
+ "SSIM": 0.9305914044380188,
+ "PSNR": 31.756643295288086,
+ "LPIPS": 0.11257877200841904,
+ "ALEX": 0.05659087002277374
+}

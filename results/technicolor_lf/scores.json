@@ -11,6 +11,46 @@
  },
  {
   "scene": "Train",
+  "method": "stac_lambda0.02",
+  "PSNR": 32.665794372558594,
+  "SSIM": 0.9435533881187439,
+  "LPIPS_ALEX": 0.040339093655347824,
+  "LPIPS_VGG": 0.07769691199064255,
+  "size_MB": 6.693,
+  "eval_folder": "ours_118000_online_compressed"
+ },
+ {
+  "scene": "Train",
+  "method": "stac_lambda0.03",
+  "PSNR": 32.67677688598633,
+  "SSIM": 0.9414915442466736,
+  "LPIPS_ALEX": 0.04504045844078064,
+  "LPIPS_VGG": 0.08149366080760956,
+  "size_MB": 5.8713,
+  "eval_folder": "ours_98000_online_compressed"
+ },
+ {
+  "scene": "Train",
+  "method": "stac_lambda0.04",
+  "PSNR": 33.086151123046875,
+  "SSIM": 0.9455245137214661,
+  "LPIPS_ALEX": 0.04447499290108681,
+  "LPIPS_VGG": 0.08070926368236542,
+  "size_MB": 5.67,
+  "eval_folder": "ours_98000_online_compressed"
+ },
+ {
+  "scene": "Train",
+  "method": "stac_lambda0.05",
+  "PSNR": 32.07769012451172,
+  "SSIM": 0.9317733645439148,
+  "LPIPS_ALEX": 0.0620417483150959,
+  "LPIPS_VGG": 0.10856994986534119,
+  "size_MB": 4.8215,
+  "eval_folder": "ours_118000_online_compressed"
+ },
+ {
+  "scene": "Train",
   "method": "4dscaffold_nocomp",
   "PSNR": 32.9232292175293,
   "SSIM": 0.9486325979232788,
@@ -28,6 +68,46 @@
   "LPIPS_VGG": 0.22565802931785583,
   "size_MB": 4.3274,
   "eval_folder": "ours_100000_online_compressed"
+ },
+ {
+  "scene": "Theater",
+  "method": "stac_lambda0.02",
+  "PSNR": 31.27614974975586,
+  "SSIM": 0.8850933909416199,
+  "LPIPS_ALEX": 0.14361026883125305,
+  "LPIPS_VGG": 0.24921144545078278,
+  "size_MB": 2.7363,
+  "eval_folder": "ours_116000_online_compressed"
+ },
+ {
+  "scene": "Theater",
+  "method": "stac_lambda0.03",
+  "PSNR": 31.37698745727539,
+  "SSIM": 0.8872236013412476,
+  "LPIPS_ALEX": 0.14238345623016357,
+  "LPIPS_VGG": 0.2443198561668396,
+  "size_MB": 2.7508,
+  "eval_folder": "ours_118000_online_compressed"
+ },
+ {
+  "scene": "Theater",
+  "method": "stac_lambda0.04",
+  "PSNR": 31.147733688354492,
+  "SSIM": 0.8879939913749695,
+  "LPIPS_ALEX": 0.14575472474098206,
+  "LPIPS_VGG": 0.24905408918857574,
+  "size_MB": 2.393,
+  "eval_folder": "ours_114000_online_compressed"
+ },
+ {
+  "scene": "Theater",
+  "method": "stac_lambda0.05",
+  "PSNR": 31.22842788696289,
+  "SSIM": 0.8879553079605103,
+  "LPIPS_ALEX": 0.14611481130123138,
+  "LPIPS_VGG": 0.2479659914970398,
+  "size_MB": 2.2309,
+  "eval_folder": "ours_118000_online_compressed"
  },
  {
   "scene": "Theater",
@@ -51,6 +131,46 @@
  },
  {
   "scene": "Birthday",
+  "method": "stac_lambda0.02",
+  "PSNR": 32.51747131347656,
+  "SSIM": 0.9426385760307312,
+  "LPIPS_ALEX": 0.0450223870575428,
+  "LPIPS_VGG": 0.09935890883207321,
+  "size_MB": 6.3922,
+  "eval_folder": "ours_120000_compressed"
+ },
+ {
+  "scene": "Birthday",
+  "method": "stac_lambda0.03",
+  "PSNR": 32.177146911621094,
+  "SSIM": 0.93999183177948,
+  "LPIPS_ALEX": 0.04783829674124718,
+  "LPIPS_VGG": 0.10261785238981247,
+  "size_MB": 5.6262,
+  "eval_folder": "ours_118000_online_compressed"
+ },
+ {
+  "scene": "Birthday",
+  "method": "stac_lambda0.04",
+  "PSNR": 32.37440872192383,
+  "SSIM": 0.9396138191223145,
+  "LPIPS_ALEX": 0.05218607932329178,
+  "LPIPS_VGG": 0.1072925552725792,
+  "size_MB": 5.2923,
+  "eval_folder": "ours_118000_online_compressed"
+ },
+ {
+  "scene": "Birthday",
+  "method": "stac_lambda0.05",
+  "PSNR": 31.756643295288086,
+  "SSIM": 0.9305914044380188,
+  "LPIPS_ALEX": 0.05659087002277374,
+  "LPIPS_VGG": 0.11257877200841904,
+  "size_MB": 4.6569,
+  "eval_folder": "ours_112000_online_compressed"
+ },
+ {
+  "scene": "Birthday",
   "method": "4dscaffold_nocomp",
   "PSNR": 32.30174255371094,
   "SSIM": 0.9479396343231201,
@@ -71,6 +191,46 @@
  },
  {
   "scene": "Painter",
+  "method": "stac_lambda0.02",
+  "PSNR": 36.3725700378418,
+  "SSIM": 0.9302236437797546,
+  "LPIPS_ALEX": 0.08530426770448685,
+  "LPIPS_VGG": 0.1660972535610199,
+  "size_MB": 2.8837,
+  "eval_folder": "ours_118000_online_compressed"
+ },
+ {
+  "scene": "Painter",
+  "method": "stac_lambda0.03",
+  "PSNR": 36.16444778442383,
+  "SSIM": 0.9271259903907776,
+  "LPIPS_ALEX": 0.09052224457263947,
+  "LPIPS_VGG": 0.173145592212677,
+  "size_MB": 2.4074,
+  "eval_folder": "ours_116000_online_compressed"
+ },
+ {
+  "scene": "Painter",
+  "method": "stac_lambda0.04",
+  "PSNR": 36.260101318359375,
+  "SSIM": 0.9236003756523132,
+  "LPIPS_ALEX": 0.09565461426973343,
+  "LPIPS_VGG": 0.17991438508033752,
+  "size_MB": 2.043,
+  "eval_folder": "ours_116000_online_compressed"
+ },
+ {
+  "scene": "Painter",
+  "method": "stac_lambda0.05",
+  "PSNR": 35.98939514160156,
+  "SSIM": 0.921195924282074,
+  "LPIPS_ALEX": 0.10024681687355042,
+  "LPIPS_VGG": 0.18506179749965668,
+  "size_MB": 1.8513,
+  "eval_folder": "ours_120000_compressed"
+ },
+ {
+  "scene": "Painter",
   "method": "4dscaffold_nocomp",
   "PSNR": 37.43226623535156,
   "SSIM": 0.9418860673904419,
@@ -88,6 +248,46 @@
   "LPIPS_VGG": 0.3163056969642639,
   "size_MB": 1.5921,
   "eval_folder": "ours_118000_online_compressed"
+ },
+ {
+  "scene": "Fabien",
+  "method": "stac_lambda0.02",
+  "PSNR": 33.85994338989258,
+  "SSIM": 0.8736317157745361,
+  "LPIPS_ALEX": 0.17872409522533417,
+  "LPIPS_VGG": 0.3308032751083374,
+  "size_MB": 1.2089,
+  "eval_folder": "ours_106000_online_compressed"
+ },
+ {
+  "scene": "Fabien",
+  "method": "stac_lambda0.03",
+  "PSNR": 33.59003829956055,
+  "SSIM": 0.8703234791755676,
+  "LPIPS_ALEX": 0.19020149111747742,
+  "LPIPS_VGG": 0.34172680974006653,
+  "size_MB": 0.975,
+  "eval_folder": "ours_100000_online_compressed"
+ },
+ {
+  "scene": "Fabien",
+  "method": "stac_lambda0.04",
+  "PSNR": 33.31689453125,
+  "SSIM": 0.8684632778167725,
+  "LPIPS_ALEX": 0.1944693922996521,
+  "LPIPS_VGG": 0.3469628095626831,
+  "size_MB": 0.888,
+  "eval_folder": "ours_108000_online_compressed"
+ },
+ {
+  "scene": "Fabien",
+  "method": "stac_lambda0.05",
+  "PSNR": 32.672183990478516,
+  "SSIM": 0.863778293132782,
+  "LPIPS_ALEX": 0.19873344898223877,
+  "LPIPS_VGG": 0.3522014617919922,
+  "size_MB": 0.8159,
+  "eval_folder": "ours_114000_online_compressed"
  },
  {
   "scene": "Fabien",

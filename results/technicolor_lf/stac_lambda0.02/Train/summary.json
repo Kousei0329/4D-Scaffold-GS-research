@@ -1,0 +1,12 @@
+{
+ "scene": "Train",
+ "method": "stac_lambda0.02",
+ "run_dir": "/workspace/data/outputs_4dscaffold/technicolor_50/Train/train_technicolor_sh/stac_lmbda_0.02_tg0.02_gth0.0002_pdt0.1_qfix_qs1e-4_120k",
+ "eval_folder": "ours_118000_online_compressed",
+ "size_MB": 6.693,
+ "size_note": "compressed bitstream size (decoded model rendered)",
+ "SSIM": 0.9435533881187439,
+ "PSNR": 32.665794372558594,
+ "LPIPS": 0.07769691199064255,
+ "ALEX": 0.040339093655347824
+}

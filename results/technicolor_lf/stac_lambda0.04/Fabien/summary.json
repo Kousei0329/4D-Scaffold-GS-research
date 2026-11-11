@@ -1,0 +1,12 @@
+{
+ "scene": "Fabien",
+ "method": "stac_lambda0.04",
+ "run_dir": "/workspace/data/outputs_4dscaffold/technicolor_50/Fabien/train_technicolor_sh/stac_lmbda_0.04_tg0.02_gth0.0002_pdt0.1_qfix_qs1e-4_120k",
+ "eval_folder": "ours_108000_online_compressed",
+ "size_MB": 0.888,
+ "size_note": "compressed bitstream size (decoded model rendered)",
+ "SSIM": 0.8684632778167725,
+ "PSNR": 33.31689453125,
+ "LPIPS": 0.3469628095626831,
+ "ALEX": 0.1944693922996521
+}
